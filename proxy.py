@@ -1,18 +1,41 @@
 #!/usr/bin/env python3
 """Reverse proxy for Ollama with rate limiting, model forcing, and API-key tiers."""
 
+import argparse
 import json
+import os
+import sys
 import time
 import threading
 import http.client
 import html
+import select
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections import defaultdict, deque
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = BASE_DIR / "config.json"
+
+
+def _resolve_config_path(argv=None):
+    """Config path: --config PATH > $OLLAMA_FRONT_CONFIG > <script-dir>/config.json."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", default=None)
+    try:
+        ns, _unknown = parser.parse_known_args(argv)
+    except SystemExit:
+        ns = argparse.Namespace(config=None)
+    if ns.config:
+        return Path(ns.config).resolve()
+    env = os.environ.get("OLLAMA_FRONT_CONFIG")
+    if env:
+        return Path(env).resolve()
+    return BASE_DIR / "config.json"
+
+
+CONFIG_PATH = _resolve_config_path()
 KEYS_PATH = BASE_DIR / "api_keys.json"
 
 with CONFIG_PATH.open() as f:
@@ -285,7 +308,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Non-blocking peek: if the client closed the socket, select() is readable
         # and recv(MSG_PEEK) reports EOF. Does not consume anything.
         try:
-            import select
             if select.select([self.connection], [], [], 0)[0]:
                 if self.connection.recv(1, socket.MSG_PEEK) == b"":
                     self._client_gone = True
@@ -335,30 +357,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             _inc_busy(1)
             self._holds_slot = True
             return True
-        with _gate_lock:
-            if _gate_waiters >= MAX_QUEUE:
-                self._status = 503
-                self._respond(503, {"error": f"proxy busy: queue full (max {MAX_QUEUE} waiting, {MAX_CONCURRENT} running)"})
-                _record(path, tier, 503, 0.0)
-                return False
-            _gate_waiters += 1
-        t0 = time.monotonic()
-        try:
-            got = _gate_sem.acquire(timeout=QUEUE_TIMEOUT)
-            if got:
-                _inc_busy(1)
-                self._holds_slot = True
-            else:
-                self._status = 503
-                self._respond(503, {"error": f"proxy busy: timed out after {int(QUEUE_TIMEOUT)}s waiting (limit {MAX_CONCURRENT} concurrent)"})
-                _record(path, tier, 503, time.monotonic() - t0)
-            return got
-        finally:
-            self._wait_seconds = round(time.monotonic() - t0, 3)
-            with _gate_lock:
-                _gate_waiters -= 1
-
-    def _handle(self):
         with _gate_lock:
             if _gate_waiters >= MAX_QUEUE:
                 self._status = 503
@@ -470,17 +468,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
             try:
                 if content_length is not None:
-                    self.wfile.write(resp.read())
+                    try:
+                        self.wfile.write(resp.read())
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        self._client_gone = True
                 else:
                     # Stream (chunked input from upstream); re-chunk to client.
+                    # Poll for client disconnect before each blocking read so an
+                    # abandoned stream frees its slot promptly instead of waiting
+                    # for the next write to fail or generation to finish.
+                    client_dead = False
                     while True:
+                        if not self._is_client_alive():
+                            client_dead = True
+                            break
                         chunk = resp.read(8192)
                         if not chunk:
                             break
                         self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
                         self.wfile.flush()
-                    self.wfile.write(b"0\r\n\r\n")
-                    self.wfile.flush()
+                    if not client_dead:
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 # Client went away mid-response. Record it, then abort the upstream
                 # connection so Ollama stops generating for nobody. The `finally`
