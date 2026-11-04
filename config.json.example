@@ -1,0 +1,16 @@
+{
+  "upstream_host": "127.0.0.1",
+  "upstream_port": 11434,
+  "listen_host": "0.0.0.0",
+  "listen_port": 11435,
+  "forced_model": "llama3.2",
+  "rate_limit_per_minute": 20,
+  "max_concurrent_requests": 10,
+  "queue_timeout_seconds": 300,
+  "max_queue_size": 20,
+  "stub_tags": true,
+  "tags_cache_refresh_seconds": 300,
+  "lightweight_paths": ["/", "/api/tags", "/api/version", "/api/ps"],
+  "blocked_download_paths": ["/api/pull"],
+  "log_requests": true
+}

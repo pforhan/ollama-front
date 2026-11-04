@@ -1,0 +1,22 @@
+[Unit]
+Description=ollama-front reverse proxy
+After=network.target ollama.service
+
+[Service]
+Type=simple
+User=pforhan
+WorkingDirectory=/home/pforhan/applications/ollama-front
+ExecStart=/usr/bin/python3 /home/pforhan/applications/ollama-front/proxy.py
+Restart=always
+RestartSec=3
+# Keep journals small and low-wear: rotate by size/time, cap total size.
+# systemd will compress + delete old journals automatically.
+SystemMaxUse=100M
+SystemKeepFree=1G
+SystemMaxFileSize=10M
+# Route stdout/stderr to journal only (no file on disk by default).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

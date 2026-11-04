@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Secrets and local machine config
+# Never commit real keys or your deployment config
+api_keys.json
+config.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs
+*.log
+
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~

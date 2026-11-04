@@ -1,0 +1,12 @@
+// Example — copy to api_keys.json and replace the placeholders below.
+// Valid format is {"tier": ["key1", "key2"]}. Do not commit the real file.
+
+// This file is intentionally NOT valid JSON until you fill it out:
+// This leading comment is invalid.
+// The trailing comma in each list is deliberate, so json.load() will fail on it.
+
+{
+  "admin": ["replace-with-admin-keys here", ],
+  "unlimited": ["replace-with-unlimited-key", ],
+  "standard": ["replace-with-standard-key", ]
+}
