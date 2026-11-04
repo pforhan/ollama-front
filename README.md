@@ -15,7 +15,7 @@ Reverse proxy in front of your local Ollama instance with:
   caches it. Non-admins always get that single cached entry — instant, no Ollama
   roundtrip, and never revealing other (blocked) models. Refreshes every
   `tags_cache_refresh_seconds` (default 300s). Admins get the real tag list.
-- **API-key tiers** (see `api_keys.json`):
+- **API-key tiers** (see `api_keys.json.example`):
   - `admin` — no restrictions (no rate limit, no model forcing, can pull models)
   - `unlimited` — no rate limit; model still forced, downloads still blocked
   - `standard` — full restrictions
@@ -39,7 +39,7 @@ Edit `config.json` to change ports, the forced model, or the rate limit.
 
 ## API keys
 
-Edit `api_keys.json`. Format is `{"tier": ["key1", "key2"]}`.
+Copy `api_keys.json.example` to `api_keys.json` and edit. Format is `{"tier": ["key1", "key2"]}`.
 Clients send the key via `Authorization: Bearer <key>` or the `X-API-Key` header.
 The file is reloaded automatically when it changes — no restart needed.
 
