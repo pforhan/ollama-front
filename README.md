@@ -20,6 +20,10 @@ Reverse proxy in front of your local Ollama instance with:
   receiving, the proxy stops generating, closes the upstream connection, and releases
   its concurrency slot immediately (`running now` on `/status` drops within ~1s).
   The request log gets a `client-disconnected` suffix.
+- **`/status` live view** — besides totals and history, the status page lists the
+  requests currently running inside Ollama and currently queued (method, path,
+  tier, client, elapsed/waiting time, queue position), plus slot/queue occupancy
+  against `max_concurrent_requests` / `max_queue_size`.
 - **`/api/tags` stub** — at startup the proxy fetches the full tag list from Ollama
   (Ollama has no per-model filter), extracts **only the forced model's real entry**, and
   caches it. Non-admins always get that single cached entry — instant, no Ollama

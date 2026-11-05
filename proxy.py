@@ -65,9 +65,14 @@ LOG_PATHS = set(CONFIG.get("log_paths")) if CONFIG.get("log_paths") else None  #
 # --- concurrency gate: at most MAX_CONCURRENT requests run inside Ollama at once.
 # Exceeding requests wait in a bounded queue; overflows/timeouts get 503.
 _gate_sem = threading.BoundedSemaphore(MAX_CONCURRENT)
-_gate_lock = threading.Lock()
+_gate_lock = threading.RLock()  # RLock: helpers like _inc_busy nest inside lock sections
 _gate_waiters = 0
 _gate_busy = 0  # requests currently inside upstream (for /status)
+# Per-request detail for the /status page: the same requests counted by
+# _gate_busy/_gate_waiters, with method/path/tier/client + timing so the
+# page shows *what* is running/queued, not just how many.
+_gate_running = []  # entries holding a slot (inside upstream)
+_gate_queued = []   # entries waiting for a slot, in arrival order
 
 
 def _inc_busy(delta):
@@ -76,7 +81,46 @@ def _inc_busy(delta):
         _gate_busy = max(0, _gate_busy + delta)
 
 
-def release_slot():
+def _remove_gate_entry(entries, entry):
+    """Remove entry by identity (two requests can share all field values).
+    Caller must hold _gate_lock."""
+    for i, e in enumerate(entries):
+        if e is entry:
+            del entries[i]
+            return True
+    return False
+
+
+def _gate_snapshot():
+    """Atomic (busy, queued, running-copy, queued-copy) for /status.
+
+    Running copies gain "elapsed" (seconds since the slot was taken);
+    queued copies gain "position" (1-based arrival order) and "waiting"
+    (seconds since joining the queue). Copies are safe to format outside
+    the lock.
+    """
+    with _gate_lock:
+        now_mono = time.monotonic()
+        running = []
+        for e in list(_gate_running):
+            d = dict(e)
+            base = e.get("started_mono") or e.get("queued_mono") or now_mono
+            d["elapsed"] = max(0.0, now_mono - base)
+            running.append(d)
+        queued = []
+        for i, e in enumerate(list(_gate_queued)):
+            d = dict(e)
+            d["position"] = i + 1
+            base = e.get("queued_mono") or now_mono
+            d["waiting"] = max(0.0, now_mono - base)
+            queued.append(d)
+        return _gate_busy, _gate_waiters, running, queued
+
+
+def release_slot(entry=None):
+    with _gate_lock:
+        if entry is not None:
+            _remove_gate_entry(_gate_running, entry)
     _inc_busy(-1)
     _gate_sem.release()
 
@@ -290,6 +334,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     _status = 0
     _wait_seconds = 0.0
     _holds_slot = False
+    _gate_entry = None
     _client_gone = False
 
     def _log(self, path, tier, extra=""):
@@ -353,18 +398,38 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if not needs_gate(path, self.command):
             return True  # lightweight GET: no slot taken
         global _gate_waiters
+        # One entry per gated request, tracked in _gate_running/_gate_queued
+        # (and removed by _handle via release_slot) so /status shows detail.
+        entry = {
+            "method": self.command,
+            "path": path,
+            "tier": tier,
+            "client": self.client_address[0],
+            "queued_at": time.time(),
+            "queued_mono": time.monotonic(),
+            "started_at": None,
+            "started_mono": None,
+            "wait_seconds": 0.0,
+        }
+        self._gate_entry = entry
         # fast-path: no waiting if a slot is free, don't count as waiter
         if _gate_sem.acquire(blocking=False):
-            _inc_busy(1)
+            entry["started_at"] = time.time()
+            entry["started_mono"] = time.monotonic()
+            with _gate_lock:
+                _gate_running.append(entry)
+                _inc_busy(1)
             self._holds_slot = True
             return True
         with _gate_lock:
             if _gate_waiters >= MAX_QUEUE:
+                self._gate_entry = None
                 self._status = 503
                 self._respond(503, {"error": f"proxy busy: queue full (max {MAX_QUEUE} waiting, {MAX_CONCURRENT} running)"})
                 _record(path, tier, 503, 0.0)
                 return False
             _gate_waiters += 1
+            _gate_queued.append(entry)
         t0 = time.monotonic()
         deadline = t0 + QUEUE_TIMEOUT
         try:
@@ -393,9 +458,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     _record(path, tier, 503, time.monotonic() - t0)
                     return False
             if got:
-                _inc_busy(1)
+                entry["started_at"] = time.time()
+                entry["started_mono"] = time.monotonic()
+                entry["wait_seconds"] = max(0.0, entry["started_mono"] - entry["queued_mono"])
+                with _gate_lock:
+                    _remove_gate_entry(_gate_queued, entry)
+                    _gate_running.append(entry)
+                    _inc_busy(1)
                 self._holds_slot = True
             else:
+                self._gate_entry = None
                 self._status = 503
                 self._respond(503, {"error": f"proxy busy: timed out after {int(QUEUE_TIMEOUT)}s waiting (limit {MAX_CONCURRENT} concurrent)"})
                 _record(path, tier, 503, time.monotonic() - t0)
@@ -404,6 +476,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._wait_seconds = round(time.monotonic() - t0, 3)
             with _gate_lock:
                 _gate_waiters -= 1
+                _remove_gate_entry(_gate_queued, entry)
 
     def _handle(self):
         start = time.monotonic()
@@ -524,7 +597,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 conn.close()
         finally:
             if self._holds_slot:
-                release_slot()
+                release_slot(self._gate_entry)
+                self._gate_entry = None
                 self._holds_slot = False
         duration = time.monotonic() - start
         self._log(path, tier, f" {round(duration, 3)}s")
@@ -589,8 +663,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             last = _stats["last_request"]
             recent = list(_stats["recent"])
 
-        busy_now = busy_count()
-        queued_now = queue_depth()
+        busy_now, queued_now, running_now, queued_list = _gate_snapshot()
 
         rate_rows = _rate_snapshot()
         keys = load_keys()
@@ -600,6 +673,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         def fmt_time(ts):
             return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "—"
+
+        def fmt_hms(ts):
+            return time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "—"
 
         def esc(x):
             return html.escape(str(x))
@@ -629,6 +705,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
         tier_key_rows = "".join(
             f"<tr><td>{esc(t)}</td><td>{n}</td></tr>" for t, n in sorted(tiers.items())
         ) or "<tr><td colspan=2>no API keys configured</td></tr>"
+        running_rows = "".join(
+            f"<tr><td>{esc(fmt_hms(r.get('started_at') or r.get('queued_at')))}</td>"
+            f"<td>{esc(r['method'])}</td><td>{esc(r['path'])}</td>"
+            f"<td>{esc(r['tier'])}</td><td>{esc(r['client'])}</td>"
+            f"<td>{r.get('elapsed', 0.0):.1f}s</td>"
+            f"<td>{r.get('wait_seconds', 0.0):.1f}s</td></tr>"
+            for r in running_now
+        ) or '<tr><td colspan="7">nothing running</td></tr>'
+        queued_rows = "".join(
+            f"<tr><td>#{r['position']}</td>"
+            f"<td>{esc(fmt_hms(r.get('queued_at')))}</td>"
+            f"<td>{esc(r['method'])}</td><td>{esc(r['path'])}</td>"
+            f"<td>{esc(r['tier'])}</td><td>{esc(r['client'])}</td>"
+            f"<td>{r.get('waiting', 0.0):.1f}s</td></tr>"
+            for r in queued_list
+        ) or '<tr><td colspan="7">nothing queued</td></tr>'
 
         health_class = "ok" if upstream_ok else "bad"
         body = f"""<!doctype html>
@@ -659,6 +751,11 @@ table{{border-collapse:collapse;min-width:280px}} td,th{{border:1px solid #ccc;p
 <div class="card"><b>{invalid}</b><span>invalid keys (401)</span></div>
 <div class="card"><b>{upstream_errs}</b><span>upstream errors (5xx)</span></div>
 </div>
+<h2>Currently running ({busy_now})</h2>
+<p>{busy_now} of {MAX_CONCURRENT} slots in use · {queued_now} of {MAX_QUEUE} queue places filled (queue timeout {int(QUEUE_TIMEOUT)}s)</p>
+<table><tr><th>Started</th><th>Method</th><th>Path</th><th>Tier</th><th>Client</th><th>Elapsed</th><th>Waited</th></tr>{running_rows}</table>
+<h2>Currently queued ({queued_now})</h2>
+<table><tr><th>#</th><th>Queued</th><th>Method</th><th>Path</th><th>Tier</th><th>Client</th><th>Waiting</th></tr>{queued_rows}</table>
 <h2>Request history</h2>
 <p>First: {esc(fmt_time(first))} &nbsp;·&nbsp; Last: {esc(fmt_time(last))}</p>
 <table><tr><th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Tier</th><th>Duration</th></tr>{recent_rows}</table>
