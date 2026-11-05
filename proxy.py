@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Reverse proxy for Ollama with rate limiting, model forcing, and API-key tiers."""
+"""Reverse proxy for Ollama with global rate limiting, model forcing, and API-key tiers.
+
+Rate limit is a single global sliding window (starts per minute) for
+anonymous+standard traffic. All tiers that reach upstream share the same
+concurrency queue (gate) — admin/unlimited are exempt only from the 429
+rate limit, not from queueing.
+Client source for logs/status comes from X-Forwarded-For /
+Tailscale-User-Login only when the TCP peer is loopback (Tailscale
+serve/funnel), otherwise the raw peer IP — so a directly-exposed proxy
+can't be spoofed via those headers."""
 
 import argparse
 import json
@@ -136,7 +145,9 @@ def busy_count():
 
 
 def needs_gate(path, method):
-    """Inference paths queue; lightweight/info GETs do not.
+    """Inference paths queue for ALL tiers (admin/unlimited/standard/anonymous).
+    Lightweight/info GETs do not, regardless of tier, because they never load
+    a model. This is path-based, not key-based.
     /api/tags is stubbed upstream of the gate and never reaches here, but
     list it as lightweight for safety if stubbing is disabled."""
     if path in LIGHTWEIGHT_PATHS and method == "GET":
@@ -250,8 +261,11 @@ def get_tier(headers):
     return key, tier
 
 
-# --- sliding-window rate limiter ---
-_hits = defaultdict(deque)
+# --- global sliding-window rate limiter ---
+# Single bucket for all anonymous+standard traffic, regardless of source IP or key.
+# (Per-IP/per-key buckets were misleading behind Tailscale serve/funnel, where
+# every client looks like 127.0.0.1, and leaked raw keys on /status.)
+_hits = deque()
 _hits_lock = threading.Lock()
 
 # --- observability for /status page ---
@@ -307,25 +321,20 @@ def _record(path, tier, status, duration):
 def _rate_snapshot():
     now = time.monotonic()
     with _hits_lock:
-        snap = []
-        for ident, q in list(_hits.items()):
-            cutoff = now - 60
-            while q and q[0] < cutoff:
-                q.popleft()
-            snap.append({"identity": ident, "used": len(q), "limit": RATE_LIMIT})
-        snap.sort(key=lambda x: x["identity"])
-        return snap
+        # Non-destructive count: GET /status shouldn't mutate the limiter.
+        # Only rate_limited() prunes expired starts.
+        used = sum(1 for t in _hits if now - t <= 60)
+    return [{"identity": "global", "used": used, "limit": RATE_LIMIT}]
 
 
-def rate_limited(identity):
+def rate_limited():
     now = time.monotonic()
     with _hits_lock:
-        q = _hits[identity]
-        while q and now - q[0] > 60:
-            q.popleft()
-        if len(q) >= RATE_LIMIT:
+        while _hits and now - _hits[0] > 60:
+            _hits.popleft()
+        if len(_hits) >= RATE_LIMIT:
             return True
-        q.append(now)
+        _hits.append(now)
         return False
 
 
@@ -337,6 +346,38 @@ class ProxyHandler(BaseHTTPRequestHandler):
     _gate_entry = None
     _client_gone = False
 
+    def _client_ip(self):
+        """Real source IP for logging/status.
+
+        When Tailscale serve/funnel is in front, tailscaled opens a new
+        loopback TCP connection, so client_address is always 127.0.0.1/::1
+        and the original IP is in X-Forwarded-For. Trust that header only
+        when the peer is loopback — otherwise anyone who can reach the proxy
+        directly could forge it.
+        """
+        peer = self.client_address[0]
+        if peer in ("127.0.0.1", "::1"):
+            xff = self.headers.get("X-Forwarded-For", "").strip()
+            if xff:
+                first = xff.split(",")[0].strip()
+                if first:
+                    return first
+        return peer
+
+    def _client_label(self):
+        """Display label for logs /status: Tailscale login + IP when available.
+
+        Prefer Tailscale-User-Login (tailnet serve only) because it's a stable
+        human identity vs a 100.x IP. Same loopback-only trust rule as _client_ip.
+        """
+        peer = self.client_address[0]
+        if peer in ("127.0.0.1", "::1"):
+            login = self.headers.get("Tailscale-User-Login", "").strip()
+            if login:
+                ip = self._client_ip()
+                return f"{login} ({ip})" if ip and ip != login else login
+        return self._client_ip()
+
     def _log(self, path, tier, extra=""):
         if not LOG_REQUESTS:
             return
@@ -347,7 +388,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         wait_note = f" waited={self._wait_seconds}s" if self._wait_seconds else ""
         if self._client_gone:
             extra += " client-disconnected"
-        print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {self.client_address[0]} "
+        print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {self._client_label()} "
               f"{self.command} {path} -> {self._status} tier={tier}{extra}{wait_note}", flush=True)
 
     def _is_client_alive(self):
@@ -394,7 +435,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._client_gone = True
 
     def _enter_gate(self, path, tier):
-        """Block until a concurrency slot frees; False if queue full, timed out, or client gone."""
+        """Block until a concurrency slot frees; False if queue full, timed out, or client gone.
+
+        Universal gate: every tier queues here (no per-key exemption). Only
+        lightweight GETs skip it via needs_gate()."""
         if not needs_gate(path, self.command):
             return True  # lightweight GET: no slot taken
         global _gate_waiters
@@ -404,7 +448,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "method": self.command,
             "path": path,
             "tier": tier,
-            "client": self.client_address[0],
+            "client": self._client_label(),
             "queued_at": time.time(),
             "queued_mono": time.monotonic(),
             "started_at": None,
@@ -512,10 +556,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._respond(403, {"error": f"{path} is disabled"})
             return
 
-        # Rate limit anonymous + standard.
+        # Rate limit anonymous + standard globally (admin/unlimited exempt from 429,
+        # but NOT from the queue below — everyone hits the gate).
         if tier in ("anonymous", "standard"):
-            identity = key or self.client_address[0]
-            if rate_limited(identity):
+            if rate_limited():
                 self._status = 429
                 self._respond(429, {"error": f"rate limit exceeded ({RATE_LIMIT}/min)"})
                 return
@@ -524,7 +568,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else None
 
         # Concurrency gate: hold a slot for the whole upstream exchange.
-        # Status page bypasses it (it never holds a slot).
+        # Universal — every tier (admin/unlimited/standard/anonymous) queues here;
+        # only lightweight GETs skip it (path-based, see needs_gate), and
+        # /, /status, non-admin /api/tags stub never reach here.
         if not self._enter_gate(path, tier):
             return
         try:
@@ -762,8 +808,8 @@ table{{border-collapse:collapse;min-width:280px}} td,th{{border:1px solid #ccc;p
 <h2>Requests by status</h2><table>{status_rows}</table>
 <h2>Requests by tier</h2><table>{tier_rows}</table>
 <h2>Requests by path</h2><table>{path_rows}</table>
-<h2>Rate-limit windows (current minute)</h2>
-<table><tr><th>IP / key</th><th>Used</th><th>State</th></tr>{rate_html_rows}</table>
+<h2>Rate-limit window (current minute)</h2>
+<table><tr><th>Scope</th><th>Used</th><th>State</th></tr>{rate_html_rows}</table>
 <h2>API keys configured</h2><table><tr><th>Tier</th><th>Key count</th></tr>{tier_key_rows}</table>
 <p><small>Auto-refreshes every 10s. API keys are never displayed.</small></p>
 </body></html>"""

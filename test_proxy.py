@@ -306,9 +306,11 @@ def main():
         st, _, _ = http_get(f"{base}/api/pull")
         check("§4 /api/pull anonymous → 403", st == 403, f"got {st}")
 
-        print("=== §4 rate limit (fresh identity) ===")
+        print("=== §4 rate limit (global anonymous+standard window) ===")
         # /api/tags for non-admins is served before the rate-limit check in
         # _handle, so use /api/version (proxied, lightweight) to exercise it.
+        # Global: the same bucket is shared across keys/IPs, so a second
+        # identity (anonymous) is also limited after the first 20.
         codes = []
         for _ in range(rate_limit + 5):
             st, _, _ = http_get(f"{base}/api/version", headers=hdr_std)
@@ -317,6 +319,9 @@ def main():
               f"first {rate_limit}: {codes[:rate_limit]}")
         check("§4 rate limit: 21st+ → 429", all(c == 429 for c in codes[rate_limit:]),
               f"rest: {codes[rate_limit:]}")
+        st, _, _ = http_get(f"{base}/api/version")
+        check("§4 rate limit global: anonymous also 429 after standard exhausts bucket",
+              st == 429, f"got {st}")
 
         print("=== §2 streaming disconnect frees slot ===")
         if args.skip_stream:
@@ -330,11 +335,14 @@ def main():
                           "covering hardware, software, and networks in depth.",
                 "stream": True}).encode()
             # Start stream in background via socket so we can hard-close it.
+            # Use admin key: the §4 rate test above exhausts the *global* bucket
+            # (anonymous+standard), and admin is exempt from 429 but still queues.
             sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+            auth_hdr = f"Authorization: Bearer {admin_key}\r\n" if admin_key else ""
             sock.sendall(
                 f"POST /api/generate HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
                 "Content-Type: application/json\r\n"
-                f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
+                f"{auth_hdr}Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
             # Read headers (generation has started, slot is held).
             headers = b""
             try:

@@ -5,16 +5,19 @@ Reverse proxy in front of your local Ollama instance with:
 - **`GET /` → `OK`** — plain-text liveness probe, no upstream call, no gate, no
   auth/rate-limit. (Your upstream's "Ollama is running" text is suppressed.)
 - **Rate limiting** — `rate_limit_per_minute` (default **20**/min, anonymous + `standard`
-  keys). Abandoned/disconnected requests still consume quota — they are counted
-  before the gate and upstream, with no refund on disconnect.
+  keys) as a **single global sliding window** (request starts, regardless of source IP or key).
+  `admin`/`unlimited` are exempt from the `429`, but not from the queue. Abandoned/
+  disconnected requests still consume quota — they are counted before the gate and
+  upstream, with no refund on disconnect.
 - **Blocked downloads** — `/api/pull` is disabled for everyone except `admin` keys.
 - **Forced model** — non-admin requests to generate/chat/embed endpoints have their
   `model` field rewritten to the configured `forced_model` (default `llama3.2`).
 - **Serialized concurrency** — at most `max_concurrent_requests` run inside Ollama at
   once (tune in `config.json`; production value is **1**); extra requests wait in a
   bounded queue (`max_queue_size`, `queue_timeout_seconds`) and get `503` when
-  full/timed out, counted as `queue rejected` on `/status`. Lightweight GETs
-  (`/`, `/api/version`, `/api/ps`, `/api/tags`) skip the gate entirely.
+  full/timed out, counted as `queue rejected` on `/status`. **Every tier queues** —
+  `admin`/`unlimited`/`standard`/anonymous alike (API key grants no queue exemption).
+  Lightweight GETs (`/`, `/api/version`, `/api/ps`, `/api/tags`) skip the gate entirely, regardless of tier.
 - **Client-disconnect handling** — streaming responses poll for a dead client
   before each blocking upstream read (`select` + `recv(MSG_PEEK)`), so if nobody is
   receiving, the proxy stops generating, closes the upstream connection, and releases
@@ -23,15 +26,16 @@ Reverse proxy in front of your local Ollama instance with:
 - **`/status` live view** — besides totals and history, the status page lists the
   requests currently running inside Ollama and currently queued (method, path,
   tier, client, elapsed/waiting time, queue position), plus slot/queue occupancy
-  against `max_concurrent_requests` / `max_queue_size`.
+  against `max_concurrent_requests` / `max_queue_size`. Client shows the real source
+  IP (or Tailscale login) when behind `tailscale serve`/`funnel` — see below.
 - **`/api/tags` stub** — at startup the proxy fetches the full tag list from Ollama
   (Ollama has no per-model filter), extracts **only the forced model's real entry**, and
   caches it. Non-admins always get that single cached entry — instant, no Ollama
   roundtrip, and never revealing other (blocked) models. Refreshes every
   `tags_cache_refresh_seconds` (default 300s). Admins get the real tag list.
 - **API-key tiers** (see `api_keys.json.example`):
-  - `admin` — no restrictions (no rate limit, no model forcing, can pull models)
-  - `unlimited` — no rate limit; model still forced, downloads still blocked
+  - `admin` — no rate limit, no model forcing, can pull models (still queues)
+  - `unlimited` — no rate limit; model still forced, downloads still blocked (still queues)
   - `standard` — full restrictions
   - no key — treated as `standard`
 
@@ -76,6 +80,12 @@ sudo tailscale funnel --bg 11435
 ```
 
 Then use `https://<your-machine>.<tailnet>.ts.net` as your Ollama base URL.
+
+> Behind `tailscale serve`/`funnel`, `tailscaled` connects over loopback, so the raw
+> TCP peer is always `127.0.0.1`. The proxy recovers the real source IP from
+> `X-Forwarded-For` (and `Tailscale-User-Login` for tailnet serve) **only** when the
+> peer is `127.0.0.1`/`::1` — a directly-exposed proxy won't accept forged headers.
+> `tailscale serve --tcp=443` (raw TCP) carries no header and loses the source IP.
 
 ## Testing
 
