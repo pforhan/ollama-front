@@ -57,6 +57,7 @@ LIGHTWEIGHT_PATHS = set(CONFIG.get("lightweight_paths",
 MAX_CONCURRENT = int(CONFIG.get("max_concurrent_requests", 1))
 QUEUE_TIMEOUT = float(CONFIG.get("queue_timeout_seconds", 300))  # seconds to wait before 503
 MAX_QUEUE = int(CONFIG.get("max_queue_size", 20))                # max waiting requests before 503
+GATE_POLL_INTERVAL = 0.5  # queued waiters re-check client liveness at this cadence
 LOG_REQUESTS = CONFIG.get("log_requests", True)
 # Cap verbose logs: only log security-relevant events by default, not health checks.
 LOG_PATHS = set(CONFIG.get("log_paths")) if CONFIG.get("log_paths") else None  # None = log all
@@ -348,7 +349,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._client_gone = True
 
     def _enter_gate(self, path, tier):
-        """Block until a concurrency slot frees; False if queue full or timed out."""
+        """Block until a concurrency slot frees; False if queue full, timed out, or client gone."""
         if not needs_gate(path, self.command):
             return True  # lightweight GET: no slot taken
         global _gate_waiters
@@ -365,8 +366,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 return False
             _gate_waiters += 1
         t0 = time.monotonic()
+        deadline = t0 + QUEUE_TIMEOUT
         try:
-            got = _gate_sem.acquire(timeout=QUEUE_TIMEOUT)
+            got = False
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # Poll in short slices so a client that disconnects while
+                # queued bails promptly instead of occupying a queue entry
+                # until the full queue timeout expires.
+                slice_timeout = min(GATE_POLL_INTERVAL, remaining)
+                if _gate_sem.acquire(timeout=slice_timeout):
+                    got = True
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                if not self._is_client_alive():
+                    self._status = 503
+                    self._log(path, tier, f" {round(time.monotonic() - t0, 3)}s queued-disconnected")
+                    # Best-effort: the socket is already dead, so _respond's
+                    # write will fail harmlessly and set _client_gone (already
+                    # set by _is_client_alive). Still call it for consistent
+                    # 503 semantics + queue_rejected accounting.
+                    self._respond(503, {"error": "proxy busy: client disconnected while queued"})
+                    _record(path, tier, 503, time.monotonic() - t0)
+                    return False
             if got:
                 _inc_busy(1)
                 self._holds_slot = True

@@ -9,13 +9,17 @@ Usage:
 
 Checks:
   §1  de-duplication: exactly one each of _enter_gate/_serve_root/_handle/…,
-      'select' + 'socket' top-level, py_compile
+      'select' + 'socket' top-level, GATE_POLL_INTERVAL queued-disconnect poll,
+      py_compile
   §3  GET / → 'OK' text/plain, bypasses auth/rate-limit/gate
   §4  /api/tags stub: non-admin sees exactly the forced model (real entry);
       admin sees full list
   §4  rate limit 20/min → 429, invalid key → 401, /api/pull → 403 (non-admin)
   §2  streaming disconnect: abort frees the concurrency slot within ~5s,
       status shows "running now" drop, log shows 'client-disconnected'
+  §2q queued disconnect: waiter killed while queued drops 'queued now'
+      promptly, surviving waiter acquires the slot, log shows
+      'queued-disconnected' (second proxy instance, concurrency=1)
   §6  quick repeat of the TODO §6 smoke commands (root/tags/stream)
 """
 
@@ -29,6 +33,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -63,6 +68,53 @@ def http_post(url, data, headers=None, timeout=10):
         return e.code, dict(e.headers), e.read()
     except Exception as e:
         return None, {}, f"{type(e).__name__}: {e}".encode()
+
+
+def status_counts(base):
+    """Parse /status HTML → (running_now, queued_now); -1 if not found."""
+    _st, _, body = http_get(f"{base}/status", timeout=5)
+    txt = body.decode(errors="replace")
+    m_run = re.search(r"<b>(\d+)</b><span>running now", txt)
+    m_q = re.search(r"<b>(\d+)</b><span>queued now", txt)
+    return (int(m_run.group(1)) if m_run else -1,
+            int(m_q.group(1)) if m_q else -1)
+
+
+def send_generate_sock(port, payload, admin_key=None, timeout=10):
+    """Open a raw socket, POST /api/generate with json payload, return sock."""
+    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    auth = f"Authorization: Bearer {admin_key}\r\n" if admin_key else ""
+    sock.sendall(
+        f"POST /api/generate HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        "Content-Type: application/json\r\n"
+        f"{auth}Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
+    return sock
+
+
+def read_http_headers(sock, timeout=10):
+    """Read until end of HTTP headers; return raw bytes gathered."""
+    sock.settimeout(timeout)
+    headers = b""
+    try:
+        while b"\r\n\r\n" not in headers:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            headers += chunk
+    except OSError:
+        pass
+    return headers
+
+
+def hard_close(sock):
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
 
 
 def parse_keys():
@@ -114,6 +166,14 @@ def check_dedup():
           "select.select" in src and "MSG_PEEK" in src)
     check("§1 streaming polls _is_client_alive before resp.read",
           "_is_client_alive()" in src and "resp.read(8192)" in src)
+    check("§1 GATE_POLL_INTERVAL constant defined (0.5s queued poll)",
+          re.search(r"GATE_POLL_INTERVAL\s*=\s*0\.5", src) is not None)
+    gate_body = re.search(r"def _enter_gate.*?(?=\n    def )", src, re.S).group(0)
+    check("§1 _enter_gate polls _is_client_alive in GATE_POLL_INTERVAL slices",
+          "GATE_POLL_INTERVAL" in gate_body and "_is_client_alive()" in gate_body
+          and "acquire(timeout=" in gate_body)
+    check("§1 _enter_gate bails with 503 + logs queued-disconnected",
+          "queued-disconnected" in src and "client disconnected while queued" in src)
     r = subprocess.run([sys.executable, "-m", "py_compile", os.path.join(BASE, "proxy.py")],
                        capture_output=True, text=True)
     check("§1 py_compile", r.returncode == 0, r.stderr.strip()[:300])
@@ -262,7 +322,13 @@ def main():
         if args.skip_stream:
             check("§2 streaming disconnect (skipped)", True, "SKIP")
         else:
-            payload = json.dumps({"model": "gemma4:e2b", "prompt": "say hi", "stream": True}).encode()
+            # Long-lived stream so the slot is still held when we check
+            # /status (short prompts can finish before the header read + 1s).
+            payload = json.dumps({
+                "model": "gemma4:e2b",
+                "prompt": "Write a detailed 500-word essay about the history of computing, "
+                          "covering hardware, software, and networks in depth.",
+                "stream": True}).encode()
             # Start stream in background via socket so we can hard-close it.
             sock = socket.create_connection(("127.0.0.1", port), timeout=10)
             sock.sendall(
@@ -292,21 +358,158 @@ def main():
                 pass
             sock.close()
             freed_within = None
-            for _ in range(20):  # poll up to ~5s
+            # resp.read(8192) aggregates up to 8192 bytes before returning,
+            # so with a long-lived stream the disconnect is only noticed on
+            # the next completed read — allow up to ~20s for the slot to free.
+            for _ in range(80):
                 time.sleep(0.25)
                 st, _, html_ = http_get(f"{base}/status")
                 m = re.search(r"<b>(\d+)</b><span>running now", html_.decode(errors="replace"))
                 if m and int(m.group(1)) == 0:
                     freed_within = True
                     break
-            check("§2 'running now' drops to 0 within ~5s of kill",
-                  freed_within is True, "still >0 after 5s" if not freed_within else "")
+            check("§2 'running now' drops to 0 within ~20s of kill",
+                  freed_within is True, "still >0 after 20s" if not freed_within else "")
 
             time.sleep(0.5)
             logfile.flush()
             log = open(f"/tmp/ollama-front-test-{port}.log").read()
             check("§2 log shows 'client-disconnected'",
                   "client-disconnected" in log, log[-500:] if "client-disconnected" not in log else "")
+
+        print("=== §2q queued disconnect bails promptly ===")
+        if args.skip_stream:
+            check("§2q queued disconnect (skipped)", True, "SKIP")
+        else:
+            port2 = free_port()
+            base2 = f"http://127.0.0.1:{port2}"
+            tmpcfg2 = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+            test_cfg2 = dict(test_cfg)
+            test_cfg2["listen_host"] = "127.0.0.1"
+            test_cfg2["listen_port"] = port2
+            test_cfg2["upstream_host"] = upstream_host
+            test_cfg2["upstream_port"] = upstream_port
+            test_cfg2["max_concurrent_requests"] = 1
+            test_cfg2["queue_timeout_seconds"] = 30
+            test_cfg2["rate_limit_per_minute"] = 1000
+            json.dump(test_cfg2, tmpcfg2)
+            tmpcfg2.close()
+            tmp_cfg2_path = tmpcfg2.name
+            logfile2 = open(f"/tmp/ollama-front-test-{port2}.log", "w")
+            proc2 = subprocess.Popen(
+                [sys.executable, os.path.join(BASE, "proxy.py"), "--config", tmp_cfg2_path],
+                stdout=logfile2, stderr=subprocess.STDOUT, cwd=BASE,
+            )
+            try:
+                ok2 = wait_ready(port2)
+                check("§2q second proxy starts (concurrency=1)", ok2, f"port {port2}")
+                if ok2:
+                    blocker_payload = json.dumps({
+                        "model": forced,
+                        "prompt": "Write a detailed 500-word essay about the history of computing, "
+                                  "covering hardware, software, and networks in depth.",
+                        "stream": True}).encode()
+                    blocker_sock = send_generate_sock(port2, blocker_payload, admin_key)
+                    read_http_headers(blocker_sock)
+                    time.sleep(1.0)
+                    running, queued = status_counts(base2)
+                    check("§2q slot held by blocker (running=1)", running == 1,
+                          f"running={running} queued={queued}")
+                    # Survivor: stays connected, queued behind blocker, then runs.
+                    survivor_payload = json.dumps(
+                        {"model": forced, "prompt": "say hi", "stream": False}).encode()
+                    survivor_result = {}
+
+                    def survivor():
+                        try:
+                            s = send_generate_sock(port2, survivor_payload, admin_key, timeout=30)
+                            s.settimeout(40)
+                            data = b""
+                            try:
+                                while True:
+                                    chunk = s.recv(8192)
+                                    if not chunk:
+                                        break
+                                    data += chunk
+                            except OSError:
+                                pass
+                            survivor_result["data"] = data
+                            survivor_result["ok"] = True
+                            hard_close(s)
+                        except Exception as e:
+                            survivor_result["err"] = f"{type(e).__name__}: {e}"
+                            survivor_result["ok"] = False
+
+                    survivor_thread = threading.Thread(target=survivor, daemon=True)
+                    survivor_thread.start()
+                    queued_seen = -1
+                    for _ in range(12):
+                        running, queued = status_counts(base2)
+                        queued_seen = queued
+                        if queued >= 1:
+                            break
+                        time.sleep(0.25)
+                    check("§2q survivor queued (queued ≥ 1)", queued_seen >= 1,
+                          f"queued={queued_seen}")
+                    # Victim: queued behind survivor, then hard-closed while waiting.
+                    victim_payload = json.dumps(
+                        {"model": forced, "prompt": "say hi", "stream": False}).encode()
+                    victim_sock = send_generate_sock(port2, victim_payload, admin_key)
+                    queued_seen = -1
+                    for _ in range(12):
+                        running, queued = status_counts(base2)
+                        queued_seen = queued
+                        if queued >= 2:
+                            break
+                        time.sleep(0.25)
+                    check("§2q victim queued (queued ≥ 2)", queued_seen >= 2,
+                          f"queued={queued_seen}")
+                    t_kill = time.monotonic()
+                    hard_close(victim_sock)
+                    queued_after = -1
+                    for _ in range(20):
+                        running, queued = status_counts(base2)
+                        queued_after = queued
+                        if queued == 1:
+                            break
+                        time.sleep(0.25)
+                    elapsed = time.monotonic() - t_kill
+                    check("§2q 'queued now' drops to 1 within ~2s of kill",
+                          queued_after == 1 and elapsed <= 2.5,
+                          f"queued={queued_after} elapsed={elapsed:.2f}s")
+                    # Free the slot: survivor should then complete.
+                    hard_close(blocker_sock)
+                    survivor_thread.join(timeout=45)
+                    survivor_ok = (not survivor_thread.is_alive()
+                                   and survivor_result.get("ok") is True
+                                   and b"200" in survivor_result.get("data", b"")[:64])
+                    check("§2q survivor completes after blocker killed", survivor_ok,
+                          f"alive={survivor_thread.is_alive()} result={survivor_result.get('err') or str(survivor_result.get('data', b''))[:80]!r}")
+                    time.sleep(0.5)
+                    logfile2.flush()
+                    log2 = open(f"/tmp/ollama-front-test-{port2}.log").read()
+                    check("§2q log shows 'queued-disconnected'",
+                          "queued-disconnected" in log2,
+                          log2[-500:] if "queued-disconnected" not in log2 else "")
+                    # Counts should settle back to idle.
+                    for _ in range(20):
+                        running, queued = status_counts(base2)
+                        if running == 0 and queued == 0:
+                            break
+                        time.sleep(0.25)
+                    check("§2q counts settle to 0/0", running == 0 and queued == 0,
+                          f"running={running} queued={queued}")
+            finally:
+                proc2.terminate()
+                try:
+                    proc2.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc2.kill()
+                logfile2.close()
+                try:
+                    os.unlink(tmp_cfg2_path)
+                except FileNotFoundError:
+                    pass
 
         print("=== §6 smoke repeat ===")
         st, hdr, body = http_get(f"{base}/")
