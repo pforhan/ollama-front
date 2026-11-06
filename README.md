@@ -63,12 +63,21 @@ Reverse proxy in front of your local Ollama instance with:
 python3 proxy.py
 ```
 
-Or install as a service:
+Or install as a service (auto-detects Linux + systemd vs. macOS + launchd):
 
 ```bash
-sudo cp ollama-front.service /etc/systemd/system/
-sudo systemctl enable --now ollama-front
+./install.sh                    # system unit on Linux (sudo), agent on macOS
+./install.sh --user             # per-user service, no sudo
+./install.sh --dry-run          # show what would be installed, change nothing
+./install.sh --status           # show service state and recent logs
+./install.sh --uninstall        # remove the service
 ```
+
+`install.sh` renders the unit/plist from the current checkout path, user,
+and `python3`, checks for `config.json` / `api_keys.json`, and verifies the
+proxy answers on its listen port. On unsupported systems it warns and shows
+how to run `proxy.py` manually — see `TODO(expand)` in `install.sh` for where
+to add another platform.
 
 The proxy listens on `0.0.0.0:11435` and forwards to Ollama on `127.0.0.1:11434`.
 Edit `config.json` to change ports, the forced model, or the rate limit.
