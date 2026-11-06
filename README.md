@@ -11,8 +11,9 @@ Reverse proxy in front of your local Ollama instance with:
   (default 100), and a strict prefix (`/`, the status page path
   (default `/proxy-status`), `/api/`, `/v1/` only).
   Probes get an nginx-style `444` drop (connection closed, no reply) and
-  never reach Ollama. Dropped probes and stale (default 10-minute-old)
-  upstream `404`s collapse into single placeholder lines on the status page, so
+  never reach Ollama. Recent request history shows the rejected path
+  for `probe_collapse_after_seconds` (default 10 minutes), then
+  collapses stale entries into a single placeholder line, so
   scans can't fill request history or requests-by-path.
 - **Rate limiting** — `rate_limit_per_minute` (default **20**/min, anonymous + `standard`
   keys) as a **single global sliding window** (request starts, regardless of source IP or key).

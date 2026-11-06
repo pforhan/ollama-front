@@ -104,8 +104,11 @@ BLOCKED_EXTENSIONS = tuple(x.lower() for x in CONFIG.get(
 BLOCKED_PATHS = tuple(x.lower() for x in CONFIG.get(
     "blocked_probe_paths",
     ['/wp-admin', '/admin', '/cgi-bin', '/phpmyadmin', '/.well-known']))
-# After this age, individual 404 records collapse into one placeholder line
-# so probe scans can't fill _stats unboundedly (default 10 minutes).
+# After this age, individual 404 records and recent probe records
+# collapse into a single placeholder line so probe scans can't fill
+# _stats unboundedly (default 10 minutes). Recent (bounded deque of
+# 50) retains the actual probe path for this window so the owner can
+# see what was rejected; by_path stays aggregated immediately.
 PROBE_COLLAPSE_AFTER_SECONDS = float(
     CONFIG.get("probe_collapse_after_seconds", 600))
 
@@ -421,9 +424,13 @@ _hits_lock = threading.Lock()
 _START_TIME = time.time()
 _stats_lock = threading.RLock()  # RLock: _record -> _collapse_old_404s nests
 # Placeholders keep probe volume visible without one dict entry per
-# random probe path. _PROBE_PLACEHOLDER is used immediately for dropped
-# probes (444); _COLLAPSED_404_PLACEHOLDER is used when stale 404s
-# (older than PROBE_COLLAPSE_AFTER_SECONDS) are collapsed.
+# random probe path. _PROBE_PLACEHOLDER is used immediately for
+# dropped probes (444) in by_path aggregation, and when recent probe
+# history older than PROBE_COLLAPSE_AFTER_SECONDS is collapsed;
+# _COLLAPSED_404_PLACEHOLDER is used when stale 404s (older than
+# PROBE_COLLAPSE_AFTER_SECONDS) are collapsed. Recent history retains
+# the actual probe path for that window — the deque is bounded to 50,
+# so it is practical there, unlike the unbounded by_path dict.
 _PROBE_PLACEHOLDER = "<blocked-probes>"
 _COLLAPSED_404_PLACEHOLDER = "<collapsed-404s>"
 _stats = {
@@ -447,12 +454,16 @@ _stats = {
 
 
 def _collapse_old_404s(now=None):
-    """Collapse 404 history older than PROBE_COLLAPSE_AFTER_SECONDS.
+    """Collapse 404 and probe history older than PROBE_COLLAPSE_AFTER_SECONDS.
 
     Mutates _stats (caller need not hold the lock): stale by_path entries
     are merged into _COLLAPSED_404_PLACEHOLDER and stale recent 404
-    entries into a single placeholder line. Triggered lazily from
-    _record() and _serve_status() — no background thread needed."""
+    entries into a single placeholder line. Stale recent 444 entries
+    (which retain the actual path for this window — see _record) are
+    merged into _PROBE_PLACEHOLDER. by_path for 444 stays aggregated
+    immediately so scans can't add one dict key per request. Triggered
+    lazily from _record() and _serve_status() — no background thread
+    needed."""
     now = time.time() if now is None else now
     cutoff = now - PROBE_COLLAPSE_AFTER_SECONDS
     with _stats_lock:
@@ -472,28 +483,33 @@ def _collapse_old_404s(now=None):
         recent = _stats["recent"]
         if recent:
             kept = []
-            old_entries = []
+            old_404 = []
+            old_probe = []
             for entry in recent:
                 ts = entry.get("ts")
-                if (entry.get("status") == 404 and ts is not None
-                        and ts < cutoff
-                        and entry.get("path") not in (_PROBE_PLACEHOLDER,
-                                                      _COLLAPSED_404_PLACEHOLDER)):
-                    old_entries.append(entry)
-                else:
-                    kept.append(entry)
-            if old_entries:
+                path = entry.get("path")
+                if (ts is not None and ts < cutoff
+                        and path not in (_PROBE_PLACEHOLDER,
+                                          _COLLAPSED_404_PLACEHOLDER)):
+                    if entry.get("status") == 404:
+                        old_404.append(entry)
+                        continue
+                    if entry.get("status") == 444:
+                        old_probe.append(entry)
+                        continue
+                kept.append(entry)
+            if old_404:
                 # Merge with any existing collapsed line so history keeps
                 # a single collapsed entry, not one per collapse batch.
                 existing = [e for e in kept
                             if e.get("path") == _COLLAPSED_404_PLACEHOLDER]
                 kept = [e for e in kept
                         if e.get("path") != _COLLAPSED_404_PLACEHOLDER]
-                merged_count = len(old_entries) + sum(
+                merged_count = len(old_404) + sum(
                     e.get("count") or 1 for e in existing)
-                merged_ts = max([e["ts"] for e in old_entries] +
+                merged_ts = max([e["ts"] for e in old_404] +
                                 [e["ts"] for e in existing if e.get("ts") is not None])
-                merged_time = next((e["time"] for e in (old_entries + existing)
+                merged_time = next((e["time"] for e in (old_404 + existing)
                                     if e.get("ts") == merged_ts), "")
                 kept.append({
                     "time": merged_time,
@@ -505,6 +521,30 @@ def _collapse_old_404s(now=None):
                     "duration": 0,
                     "count": merged_count,
                 })
+            if old_probe:
+                # Merge with any existing probe line so history keeps a
+                # single blocked-probes entry, not one per collapse batch.
+                existing = [e for e in kept
+                            if e.get("path") == _PROBE_PLACEHOLDER]
+                kept = [e for e in kept
+                        if e.get("path") != _PROBE_PLACEHOLDER]
+                merged_count = len(old_probe) + sum(
+                    e.get("count") or 1 for e in existing)
+                merged_ts = max([e["ts"] for e in old_probe] +
+                                [e["ts"] for e in existing if e.get("ts") is not None])
+                merged_time = next((e["time"] for e in (old_probe + existing)
+                                    if e.get("ts") == merged_ts), "")
+                kept.append({
+                    "time": merged_time,
+                    "ts": merged_ts,
+                    "method": "",
+                    "path": _PROBE_PLACEHOLDER,
+                    "status": 444,
+                    "tier": "-",
+                    "duration": 0,
+                    "count": merged_count,
+                })
+            if old_404 or old_probe:
                 _stats["recent"] = deque(kept, maxlen=50)
 
 
@@ -514,12 +554,15 @@ def _record(path, tier, status, duration):
         _stats["total_requests"] += 1
         _stats["by_status"][status] += 1
         _stats["by_tier"][tier] += 1
-        # Dropped probes never store their random path — aggregate
-        # immediately so a scan can't add one dict key per request.
+        # Dropped probes: by_path aggregates immediately so a scan can't
+        # add one dict key per request, but recent history (bounded deque
+        # of 50) retains the actual path for PROBE_COLLAPSE_AFTER_SECONDS
+        # so the owner can see what was rejected; _collapse_old_404s()
+        # merges stale entries into the placeholder after that window.
         if status == 444:
             _stats["by_path"][_PROBE_PLACEHOLDER] += 1
             _stats["probes_blocked"] += 1
-            stored_path = _PROBE_PLACEHOLDER
+            stored_path = path[:MAX_PATH_LENGTH].replace("\n", " ").replace("\r", " ")
         else:
             _stats["by_path"][path] += 1
             if status == 404:
@@ -687,8 +730,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _drop_probe(self, path):
         """Nginx-444: close with no reply, no Server hint, no upstream.
 
-        Records the hit only via the aggregate placeholder (never the
-        raw path) so random scans don't fill stats/log with junk."""
+        by_path aggregates via the placeholder, but recent history
+        retains the actual path for PROBE_COLLAPSE_AFTER_SECONDS."""
         self._status = 444
         self.close_connection = True
         _record(path, "anonymous", 444, 0.0)
@@ -974,8 +1017,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._client_gone = True
 
     def _serve_status(self):
-        # Collapse stale 404s first so the view never shows probe junk
-        # older than PROBE_COLLAPSE_AFTER_SECONDS (default 10 minutes).
+        # Collapse stale 404s and stale probe paths first so the view
+        # never shows probe junk older than PROBE_COLLAPSE_AFTER_SECONDS
+        # (default 10 minutes); recent probes show the actual path
+        # until then.
         _collapse_old_404s()
         # Probe upstream health (short timeout so the page never hangs).
         try:

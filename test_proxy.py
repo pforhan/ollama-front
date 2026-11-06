@@ -219,6 +219,9 @@ def check_dedup():
     check("§1 404 collapse (_collapse_old_404s, 600s default)",
           "_collapse_old_404s" in src
           and "PROBE_COLLAPSE_AFTER_SECONDS" in src)
+    check("§1 probe history retains actual path (stored_path, _PROBE_PLACEHOLDER collapse)",
+          "stored_path = path[:MAX_PATH_LENGTH]" in src
+          and "old_probe" in src and "_PROBE_PLACEHOLDER" in src)
     r = subprocess.run([sys.executable, "-m", "py_compile", os.path.join(BASE, "proxy.py")],
                        capture_output=True, text=True)
     check("§1 py_compile", r.returncode == 0, r.stderr.strip()[:300])
@@ -431,6 +434,15 @@ def main():
         st, _, body = http_get(f"{base}{status_path}")
         check(f"§5 {status_path} shows probes dropped (444)",
               st == 200 and b"probes dropped" in body,
+              f"status={st}")
+        # Recent history retains the actual rejected path immediately;
+        # it collapses to the placeholder only after
+        # probe_collapse_after_seconds in _collapse_old_404s.
+        check(f"§5 {status_path} history shows actual probe path (/wp-admin)",
+              st == 200 and b"/wp-admin" in body,
+              f"status={st} body len={len(body)}")
+        check(f"§5 {status_path} history shows actual probe path (.php)",
+              st == 200 and b"/index.php" in body,
               f"status={st}")
         # Legitimate paths still work after probes (no rate-limit burn).
         # Use admin (exempt) so this doesn't consume the §4 global bucket,
