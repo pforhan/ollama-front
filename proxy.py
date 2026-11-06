@@ -56,12 +56,13 @@ LISTEN_HOST = CONFIG["listen_host"]
 LISTEN_PORT = CONFIG["listen_port"]
 FORCED_MODEL = CONFIG["forced_model"]
 RATE_LIMIT = CONFIG["rate_limit_per_minute"]
-BLOCKED_DOWNLOAD_PATHS = set(CONFIG.get("blocked_download_paths", ["/api/pull"]))
-STUB_TAGS = CONFIG.get("stub_tags", True)  # answer /api/tags locally (blocked model only)
+BLOCKED_DOWNLOAD_PATHS = set(CONFIG.get("blocked_download_paths",
+                             ["/api/pull", "/api/create", "/api/copy", "/api/delete", "/api/push"]))
+STUB_TAGS = CONFIG.get("stub_tags", True)  # answer /api/tags + /v1/models locally (blocked model only)
 TAGS_CACHE_REFRESH_SECONDS = CONFIG.get("tags_cache_refresh_seconds", 300)  # background TTL (0 = startup only)
 # Lightweight GETs that never load/run a model — they skip the concurrency gate.
 LIGHTWEIGHT_PATHS = set(CONFIG.get("lightweight_paths",
-                       ["/", "/api/tags", "/api/version", "/api/ps"]))
+                       ["/", "/api/tags", "/api/version", "/api/ps", "/v1/models"]))
 # --- concurrency gate: serialize inference so a small box isn't oversubscribed ---
 MAX_CONCURRENT = int(CONFIG.get("max_concurrent_requests", 1))
 QUEUE_TIMEOUT = float(CONFIG.get("queue_timeout_seconds", 300))  # seconds to wait before 503
@@ -148,11 +149,33 @@ def needs_gate(path, method):
     """Inference paths queue for ALL tiers (admin/unlimited/standard/anonymous).
     Lightweight/info GETs do not, regardless of tier, because they never load
     a model. This is path-based, not key-based.
-    /api/tags is stubbed upstream of the gate and never reaches here, but
-    list it as lightweight for safety if stubbing is disabled."""
+    /api/tags and /v1/models are stubbed upstream of the gate for non-admins
+    and never reach here, but list them as lightweight for safety if stubbing
+    is disabled.
+    /api/show (POST) is likewise info-only: it reads the model manifest
+    without running inference, so it never queues — but its `model`
+    field is still forced (see MODEL_BODY_PATHS) so non-admins can only
+    ever read the forced model."""
     if path in LIGHTWEIGHT_PATHS and method == "GET":
         return False
+    if path == "/api/show":
+        return False
+    if path == "/v1/models" or path.startswith("/v1/models/"):
+        return False
     return True
+
+
+def _is_blocked_path(path):
+    """Mutation/download paths blocked for non-admins.
+
+    Exact match against BLOCKED_DOWNLOAD_PATHS (default: pull/create/copy/
+    delete/push) plus the blob prefix: /api/blobs/<digest> carries the
+    digest in the URL, so an exact-set match can never catch it."""
+    if path in BLOCKED_DOWNLOAD_PATHS:
+        return True
+    if path == "/api/blobs" or path.startswith("/api/blobs/"):
+        return True
+    return False
 
 
 # --- /api/tags stub cache ---
@@ -209,12 +232,64 @@ def _get_cached_tags_entry():
     with _tags_entry_lock:
         return _tags_entry
 
+
+# --- /v1/models stub cache (OpenAI-compatible, like /api/tags) ---
+# Same idea as tags: cache only the forced model's entry from upstream
+# /v1/models so non-admins never discover other models. Reuses the tags
+# TTL (TAGS_CACHE_REFRESH_SECONDS).
+_v1_entry = None
+_v1_entry_lock = threading.Lock()
+_v1_fetched_at = 0.0
+
+
+def _fetch_v1_entry():
+    """Fetch /v1/models from Ollama; return forced model's entry, or None."""
+    conn = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=5)
+    try:
+        conn.request("GET", "/v1/models")
+        resp = conn.getresponse()
+        data = json.loads(resp.read())
+        models = data.get("data", [])
+        for m in models:
+            if m.get("id") == FORCED_MODEL:
+                return m
+        for m in models:
+            base = (m.get("id") or "").split(":")[0]
+            if base == FORCED_MODEL.split(":")[0]:
+                return m
+        return models[0] if models else None
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _refresh_v1_cache():
+    global _v1_entry, _v1_fetched_at
+    entry = _fetch_v1_entry()
+    if entry is not None:
+        with _v1_entry_lock:
+            _v1_entry = entry
+            _v1_fetched_at = time.time()
+    return entry
+
+
+def _get_cached_v1_entry():
+    if TAGS_CACHE_REFRESH_SECONDS and time.time() - _v1_fetched_at > TAGS_CACHE_REFRESH_SECONDS:
+        _refresh_v1_cache()
+    with _v1_entry_lock:
+        return _v1_entry
+
 # Endpoints whose JSON request body carries a "model" field.
 MODEL_BODY_PATHS = (
     "/api/generate",
     "/api/chat",
     "/api/embed",
     "/api/embeddings",
+    "/api/show",
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/embeddings",
@@ -417,6 +492,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._status = 200
         self._respond(200, {"models": [entry]})
 
+    def _serve_stub_v1_models(self):
+        entry = _get_cached_v1_entry()
+        if entry is None:
+            entry = {"id": FORCED_MODEL, "object": "model",
+                     "created": 0, "owned_by": "library"}
+        self._status = 200
+        self._respond(200, {"object": "list", "data": [entry]})
+
+    def _serve_stub_v1_model(self):
+        # Single-model GET: always return the forced model (like show forcing).
+        entry = _get_cached_v1_entry()
+        if entry is None:
+            entry = {"id": FORCED_MODEL, "object": "model",
+                     "created": 0, "owned_by": "library"}
+        self._status = 200
+        self._respond(200, entry)
+
     def _serve_root(self):
         self._status = 200
         try:
@@ -438,9 +530,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         """Block until a concurrency slot frees; False if queue full, timed out, or client gone.
 
         Universal gate: every tier queues here (no per-key exemption). Only
-        lightweight GETs skip it via needs_gate()."""
+        lightweight GETs — and POST /api/show, which never runs inference —
+        skip it via needs_gate()."""
         if not needs_gate(path, self.command):
-            return True  # lightweight GET: no slot taken
+            return True  # lightweight info endpoint: no slot taken
         global _gate_waiters
         # One entry per gated request, tracked in _gate_running/_gate_queued
         # (and removed by _handle via release_slot) so /status shows detail.
@@ -542,6 +635,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._serve_stub_tags()
                 _record("/api/tags", tier0, 200, 0.0)
                 return
+        # Stub /v1/models and /v1/models/:id locally (same idea as tags).
+        # Non-admins only ever see the forced model, even when they ask for
+        # another id (like /api/show forcing). Admins see the real list.
+        if STUB_TAGS:
+            _p = self.path.split("?", 1)[0]
+            if _p == "/v1/models" or _p.startswith("/v1/models/"):
+                key0, tier0 = get_tier(self.headers)
+                if tier0 != "admin":
+                    if _p == "/v1/models":
+                        self._serve_stub_v1_models()
+                    else:
+                        self._serve_stub_v1_model()
+                    _record(_p, tier0, 200, 0.0)
+                    return
         key, tier = get_tier(self.headers)
 
         if tier == "invalid":
@@ -549,9 +656,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._respond(401, {"error": "invalid api key"})
             return
 
-        # Block downloads / pulls for non-admins.
+        # Block mutations/downloads for non-admins (pull/create/copy/delete/
+        # push/blobs) — they carry arbitrary model names/digests and forcing
+        # would be unsafe (e.g. /api/create would overwrite the forced model).
         path = self.path.split("?", 1)[0]
-        if path in BLOCKED_DOWNLOAD_PATHS and tier != "admin":
+        if _is_blocked_path(path) and tier != "admin":
             self._status = 403
             self._respond(403, {"error": f"{path} is disabled"})
             return
@@ -569,8 +678,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         # Concurrency gate: hold a slot for the whole upstream exchange.
         # Universal — every tier (admin/unlimited/standard/anonymous) queues here;
-        # only lightweight GETs skip it (path-based, see needs_gate), and
-        # /, /status, non-admin /api/tags stub never reach here.
+        # only lightweight GETs and POST /api/show skip it (path-based, see
+        # needs_gate), and /, /status, non-admin /api/tags stub never reach here.
         if not self._enter_gate(path, tier):
             return
         try:
@@ -827,8 +936,9 @@ table{{border-collapse:collapse;min-width:280px}} td,th{{border:1px solid #ccc;p
 
 
 if __name__ == "__main__":
-    # Warm the /api/tags stub cache so the first non-admin call is instant.
+    # Warm the stub caches so the first non-admin call is instant.
     _refresh_tags_cache()
+    _refresh_v1_cache()
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
     print(f"ollama-front listening on {LISTEN_HOST}:{LISTEN_PORT}, "
           f"proxying to {UPSTREAM_HOST}:{UPSTREAM_PORT}, forcing model '{FORCED_MODEL}', "

@@ -9,15 +9,21 @@ Reverse proxy in front of your local Ollama instance with:
   `admin`/`unlimited` are exempt from the `429`, but not from the queue. Abandoned/
   disconnected requests still consume quota — they are counted before the gate and
   upstream, with no refund on disconnect.
-- **Blocked downloads** — `/api/pull` is disabled for everyone except `admin` keys.
-- **Forced model** — non-admin requests to generate/chat/embed endpoints have their
-  `model` field rewritten to the configured `forced_model` (default `llama3.2`).
+- **Blocked mutations** — `/api/pull`, `/api/create`, `/api/copy`, `/api/delete`,
+  `/api/push` and `/api/blobs/*` are disabled for everyone except `admin` keys
+  (403). They carry arbitrary model names/digests, so forcing makes no sense —
+  they are blocked instead.
+- **Forced model** — non-admin requests to generate/chat/embed and `/api/show` have their
+  `model` field rewritten to the configured `forced_model` (default `llama3.2`), so
+  `/api/show` can only ever read the forced model.
 - **Serialized concurrency** — at most `max_concurrent_requests` run inside Ollama at
   once (tune in `config.json`; production value is **1**); extra requests wait in a
   bounded queue (`max_queue_size`, `queue_timeout_seconds`) and get `503` when
   full/timed out, counted as `queue rejected` on `/status`. **Every tier queues** —
   `admin`/`unlimited`/`standard`/anonymous alike (API key grants no queue exemption).
-  Lightweight GETs (`/`, `/api/version`, `/api/ps`, `/api/tags`) skip the gate entirely, regardless of tier.
+  Lightweight GETs (`/`, `/api/version`, `/api/ps`, `/api/tags`, `/v1/models`) plus
+  `POST /api/show` skip the gate entirely, regardless of tier. `POST /api/show` is info-only,
+  like `/api/tags` — it never runs inference.
 - **Client-disconnect handling** — streaming responses poll for a dead client
   before each blocking upstream read (`select` + `recv(MSG_PEEK)`), so if nobody is
   receiving, the proxy stops generating, closes the upstream connection, and releases
@@ -28,13 +34,14 @@ Reverse proxy in front of your local Ollama instance with:
   tier, client, elapsed/waiting time, queue position), plus slot/queue occupancy
   against `max_concurrent_requests` / `max_queue_size`. Client shows the real source
   IP (or Tailscale login) when behind `tailscale serve`/`funnel` — see below.
-- **`/api/tags` stub** — at startup the proxy fetches the full tag list from Ollama
+- **`/api/tags` + `/v1/models` stubs** — at startup the proxy fetches the full tag list from Ollama
   (Ollama has no per-model filter), extracts **only the forced model's real entry**, and
   caches it. Non-admins always get that single cached entry — instant, no Ollama
-  roundtrip, and never revealing other (blocked) models. Refreshes every
-  `tags_cache_refresh_seconds` (default 300s). Admins get the real tag list.
+  roundtrip, and never revealing other (blocked) models. `/v1/models` and
+  `/v1/models/:id` (OpenAI-compatible) are stubbed the same way, and refresh every
+  `tags_cache_refresh_seconds` (default 300s). Admins get the real lists.
 - **API-key tiers** (see `api_keys.json.example`):
-  - `admin` — no rate limit, no model forcing, can pull models (still queues)
+  - `admin` — no rate limit, no model forcing, can pull/create/copy/delete/push models (still queues)
   - `unlimited` — no rate limit; model still forced, downloads still blocked (still queues)
   - `standard` — full restrictions
   - no key — treated as `standard`

@@ -10,7 +10,7 @@
   "max_queue_size": 20,
   "stub_tags": true,
   "tags_cache_refresh_seconds": 300,
-  "lightweight_paths": ["/", "/api/tags", "/api/version", "/api/ps"],
-  "blocked_download_paths": ["/api/pull"],
+  "lightweight_paths": ["/", "/api/tags", "/api/version", "/api/ps", "/v1/models"],
+  "blocked_download_paths": ["/api/pull", "/api/create", "/api/copy", "/api/delete", "/api/push"],
   "log_requests": true
 }

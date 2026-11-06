@@ -152,7 +152,8 @@ def wait_ready(port, timeout=15):
 def check_dedup():
     src = open(os.path.join(BASE, "proxy.py")).read()
     for name in ("_enter_gate", "_serve_root", "_handle", "_log", "_is_client_alive",
-                 "_serve_stub_tags", "_respond", "_serve_status", "log_message"):
+                 "_serve_stub_tags", "_serve_stub_v1_models", "_serve_stub_v1_model",
+                 "_respond", "_serve_status", "log_message"):
         cnt = len(re.findall(rf"def {re.escape(name)}\s*\(", src))
         check(f"§1 dedup: exactly one def {name}", cnt == 1, f"found {cnt}")
     top = src.split("\n\n", 3)[0] if "\n\n" in src else src[:2000]
@@ -174,6 +175,20 @@ def check_dedup():
           and "acquire(timeout=" in gate_body)
     check("§1 _enter_gate bails with 503 + logs queued-disconnected",
           "queued-disconnected" in src and "client disconnected while queued" in src)
+    check("§1 /api/show model forcing (MODEL_BODY_PATHS)",
+          '"/api/show"' in src and "MODEL_BODY_PATHS" in src)
+    needs_gate_body = re.search(r"def needs_gate.*?(?=\n(?:# |def |_tags_entry|class ))", src, re.S)
+    needs_gate_body = needs_gate_body.group(0) if needs_gate_body else ""
+    check("§1 /api/show skips gate (needs_gate)",
+          '"/api/show"' in needs_gate_body)
+    check("§1 /v1/models skips gate (needs_gate)",
+          '"/v1/models"' in needs_gate_body)
+    check("§1 blocked mutations include create/copy/delete/push",
+          all(f'"/api/{p}"' in src for p in ("pull", "create", "copy", "delete", "push")))
+    check("§1 blob prefix block (_is_blocked_path)",
+          "_is_blocked_path" in src and "/api/blobs" in src)
+    check("§1 /v1/models stub (serve)",
+          "_serve_stub_v1_models" in src and "_serve_stub_v1_model" in src)
     r = subprocess.run([sys.executable, "-m", "py_compile", os.path.join(BASE, "proxy.py")],
                        capture_output=True, text=True)
     check("§1 py_compile", r.returncode == 0, r.stderr.strip()[:300])
@@ -298,6 +313,41 @@ def main():
               len(admin_models) == len(upstream_models) and len(admin_models) > 1,
               f"admin={len(admin_models)} upstream={len(upstream_models)}")
 
+        print("=== §4 /v1/models stub ===")
+        st, _, body = http_get(f"{base}/v1/models")
+        check("§4 /v1/models anonymous 200", st == 200, f"got {st}")
+        try:
+            v1_data = json.loads(body).get("data", [])
+        except Exception:
+            v1_data = []
+        check("§4 /v1/models stub has exactly 1 model", len(v1_data) == 1,
+              f"got {len(v1_data)}: {[m.get('id') for m in v1_data]}")
+        if len(v1_data) == 1:
+            check("§4 /v1/models stub is forced model",
+                  forced in (v1_data[0].get("id") or ""),
+                  f"id={v1_data[0].get('id')!r} forced={forced!r}")
+        # Single-model GET for non-admin must return forced model, even when
+        # asking for a different (blocked) id.
+        blocked_id = next((m for m in upstream_models
+                           if forced.split(":")[0] not in (m or "")), None)
+        if blocked_id:
+            st, _, body = http_get(f"{base}/v1/models/{blocked_id}")
+            try:
+                single = json.loads(body)
+            except Exception:
+                single = {}
+            check("§4 /v1/models/:id non-admin returns forced model",
+                  st == 200 and forced in (single.get("id") or ""),
+                  f"status={st} id={single.get('id')!r} asked={blocked_id!r}")
+        st, _, body = http_get(f"{base}/v1/models", headers=hdr_admin)
+        try:
+            admin_v1 = json.loads(body).get("data", [])
+        except Exception:
+            admin_v1 = []
+        check("§4 admin /v1/models sees full list",
+              len(admin_v1) == len(upstream_models) and len(admin_v1) > 1,
+              f"admin={len(admin_v1)} upstream={len(upstream_models)}")
+
         print("=== §4 auth / blocks ===")
         st, _, _ = http_get(f"{base}/api/version", headers={"Authorization": "Bearer bogus-test-key"})
         check("§4 invalid key → 401", st == 401, f"got {st}")
@@ -305,6 +355,16 @@ def main():
         check("§4 /api/pull non-admin → 403", st == 403, f"got {st}")
         st, _, _ = http_get(f"{base}/api/pull")
         check("§4 /api/pull anonymous → 403", st == 403, f"got {st}")
+        # Mutation endpoints are blocked for non-admins (path-based check,
+        # before the rate limiter, so these don't consume the quota bucket).
+        for _mp, _label in (("/api/create", "create"), ("/api/copy", "copy"),
+                            ("/api/delete", "delete"), ("/api/push", "push")):
+            st, _, _ = http_get(f"{base}{_mp}", headers=hdr_std)
+            check(f"§4 {_mp} non-admin → 403", st == 403, f"got {st}")
+            st, _, _ = http_get(f"{base}{_mp}")
+            check(f"§4 {_mp} anonymous → 403", st == 403, f"got {st}")
+        st, _, _ = http_get(f"{base}/api/blobs/sha256:0123456789abcdef", headers=hdr_std)
+        check("§4 /api/blobs/* non-admin → 403", st == 403, f"got {st}")
 
         print("=== §4 rate limit (global anonymous+standard window) ===")
         # /api/tags for non-admins is served before the rate-limit check in
@@ -524,6 +584,18 @@ def main():
         check("§6 GET / → OK", st == 200 and body.strip() == b"OK")
         st, _, body = http_get(f"{base}/api/tags", headers=hdr_admin)
         check("§6 /api/tags (admin) 200", st == 200)
+        # Admin /api/show is exempt from the global rate-limit bucket, so it
+        # stays usable after the rate test exhausts it. Non-admin forcing is
+        # covered statically (§1 MODEL_BODY_PATHS + needs_gate) plus manual
+        # verification — a live non-admin call here would 429 (as intended,
+        # show respects the limiter like /api/version).
+        # Use the first upstream model so admin always has something real to show.
+        show_model = upstream_models[0] if upstream_models else forced
+        st, _, body = http_post(f"{base}/api/show", json.dumps({"model": show_model}).encode(),
+                                headers={**hdr_admin, "Content-Type": "application/json"})
+        check("§6 /api/show (admin) 200", st == 200, f"got {st}: {body[:200]}")
+        st, _, body = http_get(f"{base}/v1/models", headers=hdr_admin)
+        check("§6 /v1/models (admin) 200", st == 200)
 
     finally:
         if proc is not None:
