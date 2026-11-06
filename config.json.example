@@ -13,5 +13,9 @@
   "tags_cache_refresh_seconds": 300,
   "lightweight_paths": ["/", "/api/tags", "/api/version", "/api/ps", "/v1/models"],
   "blocked_download_paths": ["/api/pull", "/api/create", "/api/copy", "/api/delete", "/api/push"],
-  "log_requests": true
+  "log_requests": true,
+  "max_path_length": 100,
+  "blocked_probe_extensions": [".php", ".asp", ".aspx", ".jsp", ".env", ".yaml", ".yml", ".git"],
+  "blocked_probe_paths": ["/wp-admin", "/admin", "/cgi-bin", "/phpmyadmin", "/.well-known"],
+  "probe_collapse_after_seconds": 600
 }

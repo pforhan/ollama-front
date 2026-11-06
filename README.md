@@ -5,6 +5,14 @@ Reverse proxy in front of your local Ollama instance with:
 - **`GET /` → `root_response`** — plain-text `root_response` (default `OK`) as a
   liveness probe, no upstream call, no gate, no
   auth/rate-limit. (Your upstream's "Ollama is running" text is suppressed.)
+- **Probe mitigation** — before auth, rate-limit, gate, or upstream, paths
+  are validated: blocked extensions (`.php`, `.env`, `.git`, …) and prefixes
+  (`/wp-admin`, `/admin`, `/cgi-bin`, …), a strict `max_path_length`
+  (default 100), and a strict prefix (`/`, `/status`, `/api/`, `/v1/` only).
+  Probes get an nginx-style `444` drop (connection closed, no reply) and
+  never reach Ollama. Dropped probes and stale (default 10-minute-old)
+  upstream `404`s collapse into single placeholder lines on `/status`, so
+  scans can't fill request history or requests-by-path.
 - **Rate limiting** — `rate_limit_per_minute` (default **20**/min, anonymous + `standard`
   keys) as a **single global sliding window** (request starts, regardless of source IP or key).
   `admin`/`unlimited` are exempt from the `429`, but not from the queue. Abandoned/

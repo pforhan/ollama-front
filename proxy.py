@@ -78,6 +78,23 @@ elif not isinstance(ROOT_RESPONSE, str):
 # Cap verbose logs: only log security-relevant events by default, not health checks.
 LOG_PATHS = set(CONFIG.get("log_paths")) if CONFIG.get("log_paths") else None  # None = log all
 
+# --- probe mitigation (before upstream) ---
+# Invalid paths are dropped nginx-444 style (close with no reply) and never
+# reach upstream, auth, rate-limit, or the concurrency gate. Three signals
+# are combined in is_probe(): known probe extensions/patterns, over-long
+# paths, and a strict /api/ | /v1/ prefix (plus / and /status).
+MAX_PATH_LENGTH = int(CONFIG.get("max_path_length", 100))
+BLOCKED_EXTENSIONS = tuple(x.lower() for x in CONFIG.get(
+    "blocked_probe_extensions",
+    ['.php', '.asp', '.aspx', '.jsp', '.env', '.yaml', '.yml', '.git']))
+BLOCKED_PATHS = tuple(x.lower() for x in CONFIG.get(
+    "blocked_probe_paths",
+    ['/wp-admin', '/admin', '/cgi-bin', '/phpmyadmin', '/.well-known']))
+# After this age, individual 404 records collapse into one placeholder line
+# so probe scans can't fill _stats unboundedly (default 10 minutes).
+PROBE_COLLAPSE_AFTER_SECONDS = float(
+    CONFIG.get("probe_collapse_after_seconds", 600))
+
 # --- concurrency gate: at most MAX_CONCURRENT requests run inside Ollama at once.
 # Exceeding requests wait in a bounded queue; overflows/timeouts get 503.
 _gate_sem = threading.BoundedSemaphore(MAX_CONCURRENT)
@@ -180,6 +197,43 @@ def _is_blocked_path(path):
     if path in BLOCKED_DOWNLOAD_PATHS:
         return True
     if path == "/api/blobs" or path.startswith("/api/blobs/"):
+        return True
+    return False
+
+
+# --- probe mitigation helpers ---
+# Path passed to these helpers is expected to be query-stripped
+# (self.path.split("?", 1)[0]) — callers in _handle do that once.
+
+def is_obviously_a_probe(path: str) -> bool:
+    """Known probe extensions & admin-panel prefixes (TODO list)."""
+    path_lower = path.lower()
+    if path_lower.endswith(BLOCKED_EXTENSIONS):
+        return True
+    if path_lower.startswith(BLOCKED_PATHS):
+        return True
+    return False
+
+
+def is_valid_ollama(path: str) -> bool:
+    """Only locally-served names plus /api/ and /v1/ ever proxy upstream."""
+    if path in ("/", "/status", "/api", "/v1"):
+        return True
+    if path.startswith("/api/") or path.startswith("/v1/"):
+        return True
+    return False
+
+
+def is_probe(path: str) -> bool:
+    """True if path should be dropped (nginx-444) before upstream.
+
+    Combines all three lightweight strategies: blocked extensions/paths,
+    a strict max-length, and a strict valid-prefix check."""
+    if len(path) > MAX_PATH_LENGTH:
+        return True
+    if is_obviously_a_probe(path):
+        return True
+    if not is_valid_ollama(path):
         return True
     return False
 
@@ -351,7 +405,13 @@ _hits_lock = threading.Lock()
 
 # --- observability for /status page ---
 _START_TIME = time.time()
-_stats_lock = threading.Lock()
+_stats_lock = threading.RLock()  # RLock: _record -> _collapse_old_404s nests
+# Placeholders keep probe volume visible without one dict entry per
+# random probe path. _PROBE_PLACEHOLDER is used immediately for dropped
+# probes (444); _COLLAPSED_404_PLACEHOLDER is used when stale 404s
+# (older than PROBE_COLLAPSE_AFTER_SECONDS) are collapsed.
+_PROBE_PLACEHOLDER = "<blocked-probes>"
+_COLLAPSED_404_PLACEHOLDER = "<collapsed-404s>"
 _stats = {
     "total_requests": 0,
     "by_status": defaultdict(int),
@@ -363,10 +423,75 @@ _stats = {
     "upstream_errors": 0,
     "queue_rejected": 0,
     "queue_timed_out": 0,
+    "probes_blocked": 0,
+    "collapsed_404s": 0,
+    "_by_path_404_ts": {},  # path -> last-seen ts, for 404 paths only
     "first_request": None,
     "last_request": None,
     "recent": deque(maxlen=50),
 }
+
+
+def _collapse_old_404s(now=None):
+    """Collapse 404 history older than PROBE_COLLAPSE_AFTER_SECONDS.
+
+    Mutates _stats (caller need not hold the lock): stale by_path entries
+    are merged into _COLLAPSED_404_PLACEHOLDER and stale recent 404
+    entries into a single placeholder line. Triggered lazily from
+    _record() and _serve_status() — no background thread needed."""
+    now = time.time() if now is None else now
+    cutoff = now - PROBE_COLLAPSE_AFTER_SECONDS
+    with _stats_lock:
+        ts_map = _stats.get("_by_path_404_ts")
+        if ts_map is not None:
+            old = [p for p, ts in ts_map.items()
+                   if ts < cutoff and p not in (_PROBE_PLACEHOLDER,
+                                                _COLLAPSED_404_PLACEHOLDER)]
+            if old:
+                total = 0
+                for p in old:
+                    total += _stats["by_path"].pop(p, 0)
+                    del ts_map[p]
+                if total:
+                    _stats["by_path"][_COLLAPSED_404_PLACEHOLDER] += total
+                    _stats["collapsed_404s"] += total
+        recent = _stats["recent"]
+        if recent:
+            kept = []
+            old_entries = []
+            for entry in recent:
+                ts = entry.get("ts")
+                if (entry.get("status") == 404 and ts is not None
+                        and ts < cutoff
+                        and entry.get("path") not in (_PROBE_PLACEHOLDER,
+                                                      _COLLAPSED_404_PLACEHOLDER)):
+                    old_entries.append(entry)
+                else:
+                    kept.append(entry)
+            if old_entries:
+                # Merge with any existing collapsed line so history keeps
+                # a single collapsed entry, not one per collapse batch.
+                existing = [e for e in kept
+                            if e.get("path") == _COLLAPSED_404_PLACEHOLDER]
+                kept = [e for e in kept
+                        if e.get("path") != _COLLAPSED_404_PLACEHOLDER]
+                merged_count = len(old_entries) + sum(
+                    e.get("count") or 1 for e in existing)
+                merged_ts = max([e["ts"] for e in old_entries] +
+                                [e["ts"] for e in existing if e.get("ts") is not None])
+                merged_time = next((e["time"] for e in (old_entries + existing)
+                                    if e.get("ts") == merged_ts), "")
+                kept.append({
+                    "time": merged_time,
+                    "ts": merged_ts,
+                    "method": "",
+                    "path": _COLLAPSED_404_PLACEHOLDER,
+                    "status": 404,
+                    "tier": "-",
+                    "duration": 0,
+                    "count": merged_count,
+                })
+                _stats["recent"] = deque(kept, maxlen=50)
 
 
 def _record(path, tier, status, duration):
@@ -375,7 +500,17 @@ def _record(path, tier, status, duration):
         _stats["total_requests"] += 1
         _stats["by_status"][status] += 1
         _stats["by_tier"][tier] += 1
-        _stats["by_path"][path] += 1
+        # Dropped probes never store their random path — aggregate
+        # immediately so a scan can't add one dict key per request.
+        if status == 444:
+            _stats["by_path"][_PROBE_PLACEHOLDER] += 1
+            _stats["probes_blocked"] += 1
+            stored_path = _PROBE_PLACEHOLDER
+        else:
+            _stats["by_path"][path] += 1
+            if status == 404:
+                _stats["_by_path_404_ts"][path] = now
+            stored_path = path
         if status == 401:
             _stats["invalid_keys"] += 1
         elif status == 403:
@@ -391,12 +526,14 @@ def _record(path, tier, status, duration):
         _stats["last_request"] = now
         _stats["recent"].appendleft({
             "time": time.strftime("%H:%M:%S", time.localtime(now)),
+            "ts": now,
             "method": "",
-            "path": path,
+            "path": stored_path,
             "status": status,
             "tier": tier,
             "duration": round(duration, 3),
         })
+    _collapse_old_404s(now)
 
 
 def _rate_snapshot():
@@ -532,6 +669,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             self._client_gone = True
 
+    def _drop_probe(self, path):
+        """Nginx-444: close with no reply, no Server hint, no upstream.
+
+        Records the hit only via the aggregate placeholder (never the
+        raw path) so random scans don't fill stats/log with junk."""
+        self._status = 444
+        self.close_connection = True
+        _record(path, "anonymous", 444, 0.0)
+        with _stats_lock:
+            if _stats["recent"]:
+                _stats["recent"][0]["method"] = self.command
+        if LOG_REQUESTS:
+            safe = path[:MAX_PATH_LENGTH].replace("\n", " ").replace("\r", " ")
+            print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {self._client_label()} "
+                  f"{self.command} {safe} -> 444 probe-dropped", flush=True)
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.connection.close()
+        except OSError:
+            pass
+
     def _enter_gate(self, path, tier):
         """Block until a concurrency slot frees; False if queue full, timed out, or client gone.
 
@@ -622,6 +783,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 _remove_gate_entry(_gate_queued, entry)
 
     def _handle(self):
+        # Probe mitigation, before auth / rate-limit / gate / upstream:
+        # invalid paths get an nginx-444 drop (no reply, no upstream).
+        _req_path = self.path.split("?", 1)[0]
+        if is_probe(_req_path):
+            self._drop_probe(_req_path)
+            return
         start = time.monotonic()
         # Root liveness probe: plain-text, no upstream call, no queue.
         if self.path.split("?", 1)[0] == "/" and self.command == "GET":
@@ -792,6 +959,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._client_gone = True
 
     def _serve_status(self):
+        # Collapse stale 404s first so the view never shows probe junk
+        # older than PROBE_COLLAPSE_AFTER_SECONDS (default 10 minutes).
+        _collapse_old_404s()
         # Probe upstream health (short timeout so the page never hangs).
         try:
             upstream = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=1)
@@ -820,6 +990,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             invalid = _stats["invalid_keys"]
             upstream_errs = _stats["upstream_errors"]
             queue_rejected = _stats["queue_rejected"]
+            probes_blocked = _stats["probes_blocked"]
+            collapsed_404s = _stats["collapsed_404s"]
             first = _stats["first_request"]
             last = _stats["last_request"]
             recent = list(_stats["recent"])
@@ -853,7 +1025,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         ) or "<tr><td colspan=2>no requests yet</td></tr>"
         recent_rows = "".join(
             f"<tr><td>{esc(r['time'])}</td><td>{esc(r['method'])}</td>"
-            f"<td>{esc(r['path'])}</td><td>{esc(r['status'])}</td>"
+            f"<td>{esc(r['path'])}{esc(f' ×{r['count']}' if r.get('count') and r['count'] > 1 else '')}</td>"
+            f"<td>{esc(r['status'])}</td>"
             f"<td>{esc(r['tier'])}</td><td>{esc(r['duration'])}s</td></tr>"
             for r in recent
         ) or "<tr><td colspan=6>no requests yet</td></tr>"
@@ -911,6 +1084,8 @@ table{{border-collapse:collapse;min-width:280px}} td,th{{border:1px solid #ccc;p
 <div class="card"><b>{blocked}</b><span>blocked pulls (403)</span></div>
 <div class="card"><b>{invalid}</b><span>invalid keys (401)</span></div>
 <div class="card"><b>{upstream_errs}</b><span>upstream errors (5xx)</span></div>
+<div class="card"><b>{probes_blocked}</b><span>probes dropped (444)</span></div>
+<div class="card"><b>{collapsed_404s}</b><span>collapsed 404s</span></div>
 </div>
 <h2>Currently running ({busy_now})</h2>
 <p>{busy_now} of {MAX_CONCURRENT} slots in use · {queued_now} of {MAX_QUEUE} queue places filled (queue timeout {int(QUEUE_TIMEOUT)}s)</p>

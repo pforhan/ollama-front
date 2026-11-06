@@ -153,7 +153,7 @@ def check_dedup():
     src = open(os.path.join(BASE, "proxy.py")).read()
     for name in ("_enter_gate", "_serve_root", "_handle", "_log", "_is_client_alive",
                  "_serve_stub_tags", "_serve_stub_v1_models", "_serve_stub_v1_model",
-                 "_respond", "_serve_status", "log_message"):
+                 "_respond", "_serve_status", "_drop_probe", "log_message"):
         cnt = len(re.findall(rf"def {re.escape(name)}\s*\(", src))
         check(f"§1 dedup: exactly one def {name}", cnt == 1, f"found {cnt}")
     top = src.split("\n\n", 3)[0] if "\n\n" in src else src[:2000]
@@ -196,6 +196,22 @@ def check_dedup():
     root_body = root_body.group(0) if root_body else ""
     check("§1 _serve_root serves ROOT_RESPONSE, no hardcoded b\"OK\"",
           "ROOT_RESPONSE" in root_body and 'b"OK"' not in root_body)
+    check("§1 probe helpers (is_obviously_a_probe/is_valid_ollama/is_probe)",
+          all(n in src for n in ("def is_obviously_a_probe",
+                                 "def is_valid_ollama", "def is_probe")))
+    check("§1 probe constants (BLOCKED_EXTENSIONS/BLOCKED_PATHS/MAX_PATH_LENGTH)",
+          all(n in src for n in ("BLOCKED_EXTENSIONS", "BLOCKED_PATHS",
+                                 "MAX_PATH_LENGTH")))
+    check("§1 probe blocked extensions include .php/.env/.git",
+          all(f"'{e}'" in src or f'"{e}"' in src
+              for e in (".php", ".env", ".git")))
+    check("§1 probe blocked paths include /wp-admin//.well-known",
+          all(p in src for p in ("/wp-admin", "/.well-known", "/phpmyadmin")))
+    check("§1 probe 444 drop (_drop_probe, probe-dropped)",
+          "_drop_probe" in src and "probe-dropped" in src)
+    check("§1 404 collapse (_collapse_old_404s, 600s default)",
+          "_collapse_old_404s" in src
+          and "PROBE_COLLAPSE_AFTER_SECONDS" in src)
     r = subprocess.run([sys.executable, "-m", "py_compile", os.path.join(BASE, "proxy.py")],
                        capture_output=True, text=True)
     check("§1 py_compile", r.returncode == 0, r.stderr.strip()[:300])
@@ -380,6 +396,25 @@ def main():
             check(f"§4 {_mp} anonymous → 403", st == 403, f"got {st}")
         st, _, _ = http_get(f"{base}/api/blobs/sha256:0123456789abcdef", headers=hdr_std)
         check("§4 /api/blobs/* non-admin → 403", st == 403, f"got {st}")
+
+        print("=== §5 probe mitigation (444 drop, no upstream) ===")
+        # Probes get an nginx-444 drop: connection closed with no reply,
+        # so http_get sees no HTTP status (None) — never 200/401/404.
+        for _probe in ("/wp-admin", "/admin", "/index.php", "/api/chat.php",
+                       "/foo", "/api/" + "x" * 120):
+            st, _, _ = http_get(f"{base}{_probe}")
+            check(f"§5 probe {_probe[:30]} dropped (no reply)",
+                  st is None, f"got status={st}")
+        st, _, body = http_get(f"{base}/status")
+        check("§5 /status shows probes dropped (444)",
+              st == 200 and b"probes dropped" in body,
+              f"status={st}")
+        # Legitimate paths still work after probes (no rate-limit burn).
+        # Use admin (exempt) so this doesn't consume the §4 global bucket,
+        # or the anon /api/tags stub which bypasses the limiter entirely.
+        st, _, _ = http_get(f"{base}/api/version", headers=hdr_admin)
+        check("§5 legitimate /api/version still 200 after probes",
+              st == 200, f"got {st}")
 
         print("=== §4 rate limit (global anonymous+standard window) ===")
         # /api/tags for non-admins is served before the rate-limit check in
