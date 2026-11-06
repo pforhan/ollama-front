@@ -69,6 +69,12 @@ QUEUE_TIMEOUT = float(CONFIG.get("queue_timeout_seconds", 300))  # seconds to wa
 MAX_QUEUE = int(CONFIG.get("max_queue_size", 20))                # max waiting requests before 503
 GATE_POLL_INTERVAL = 0.5  # queued waiters re-check client liveness at this cadence
 LOG_REQUESTS = CONFIG.get("log_requests", True)
+# Plain-text body served for GET / (liveness probe). Kept as a simple string.
+ROOT_RESPONSE = CONFIG.get("root_response", "OK")
+if ROOT_RESPONSE is None:
+    ROOT_RESPONSE = "OK"
+elif not isinstance(ROOT_RESPONSE, str):
+    ROOT_RESPONSE = str(ROOT_RESPONSE)
 # Cap verbose logs: only log security-relevant events by default, not health checks.
 LOG_PATHS = set(CONFIG.get("log_paths")) if CONFIG.get("log_paths") else None  # None = log all
 
@@ -512,7 +518,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _serve_root(self):
         self._status = 200
         try:
-            body = b"OK"
+            body = ROOT_RESPONSE.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -617,7 +623,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _handle(self):
         start = time.monotonic()
-        # Root liveness probe: plain-text OK, no upstream call, no queue.
+        # Root liveness probe: plain-text, no upstream call, no queue.
         if self.path.split("?", 1)[0] == "/" and self.command == "GET":
             self._serve_root()
             _record("/", "anonymous", 200, 0.0)

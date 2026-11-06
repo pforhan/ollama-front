@@ -11,7 +11,7 @@ Checks:
   §1  de-duplication: exactly one each of _enter_gate/_serve_root/_handle/…,
       'select' + 'socket' top-level, GATE_POLL_INTERVAL queued-disconnect poll,
       py_compile
-  §3  GET / → 'OK' text/plain, bypasses auth/rate-limit/gate
+  §3  GET / → root_response (default 'OK') text/plain, bypasses auth/rate-limit/gate
   §4  /api/tags stub: non-admin sees exactly the forced model (real entry);
       admin sees full list
   §4  rate limit 20/min → 429, invalid key → 401, /api/pull → 403 (non-admin)
@@ -189,6 +189,13 @@ def check_dedup():
           "_is_blocked_path" in src and "/api/blobs" in src)
     check("§1 /v1/models stub (serve)",
           "_serve_stub_v1_models" in src and "_serve_stub_v1_model" in src)
+    check("§1 root response from config (root_response)",
+          re.search(r'CONFIG\.get\(\s*"root_response"', src) is not None
+          and re.search(r"ROOT_RESPONSE\s*=", src) is not None)
+    root_body = re.search(r"def _serve_root.*?(?=\n    def )", src, re.S)
+    root_body = root_body.group(0) if root_body else ""
+    check("§1 _serve_root serves ROOT_RESPONSE, no hardcoded b\"OK\"",
+          "ROOT_RESPONSE" in root_body and 'b"OK"' not in root_body)
     r = subprocess.run([sys.executable, "-m", "py_compile", os.path.join(BASE, "proxy.py")],
                        capture_output=True, text=True)
     check("§1 py_compile", r.returncode == 0, r.stderr.strip()[:300])
@@ -216,6 +223,13 @@ def main():
     rate_limit = int(config["rate_limit_per_minute"])
     upstream_host = config["upstream_host"]
     upstream_port = args.upstream_port
+    # Root probe body: from config (same default as proxy.py), not hardcoded.
+    _root_cfg = config.get("root_response", "OK")
+    if _root_cfg is None:
+        _root_cfg = "OK"
+    elif not isinstance(_root_cfg, str):
+        _root_cfg = str(_root_cfg)
+    expected_root = _root_cfg.encode("utf-8")
 
     # Verify upstream is reachable (proxy warms cache from it).
     st, _, body = http_get(f"http://{upstream_host}:{upstream_port}/api/tags", timeout=5)
@@ -266,10 +280,11 @@ def main():
             print(open(f"/tmp/ollama-front-test-{port}.log").read()[-2000:])
             return 1
 
-        print("=== §3 GET / → OK ===")
+        print("=== §3 GET / → root_response ===")
         st, hdr, body = http_get(f"{base}/")
         check("§3 GET / returns 200", st == 200, f"got {st}: {body[:120]}")
-        check("§3 GET / body is 'OK'", body.strip() == b"OK", f"got {body[:80]!r}")
+        check("§3 GET / body matches root_response", body == expected_root,
+              f"got {body[:80]!r}, expected {expected_root[:80]!r}")
         check("§3 GET / Content-Type text/plain",
               "text/plain" in hdr.get("Content-Type", ""), hdr.get("Content-Type"))
         check("§3 GET / contains no 'Ollama is running'",
@@ -581,7 +596,7 @@ def main():
 
         print("=== §6 smoke repeat ===")
         st, hdr, body = http_get(f"{base}/")
-        check("§6 GET / → OK", st == 200 and body.strip() == b"OK")
+        check("§6 GET / → root_response", st == 200 and body == expected_root)
         st, _, body = http_get(f"{base}/api/tags", headers=hdr_admin)
         check("§6 /api/tags (admin) 200", st == 200)
         # Admin /api/show is exempt from the global rate-limit bucket, so it

@@ -2,7 +2,8 @@
 
 Reverse proxy in front of your local Ollama instance with:
 
-- **`GET /` → `OK`** — plain-text liveness probe, no upstream call, no gate, no
+- **`GET /` → `root_response`** — plain-text `root_response` (default `OK`) as a
+  liveness probe, no upstream call, no gate, no
   auth/rate-limit. (Your upstream's "Ollama is running" text is suppressed.)
 - **Rate limiting** — `rate_limit_per_minute` (default **20**/min, anonymous + `standard`
   keys) as a **single global sliding window** (request starts, regardless of source IP or key).
@@ -104,7 +105,7 @@ python3 test_proxy.py --upstream-port 11434
 
 `test_proxy.py` starts its own throwaway proxy on an ephemeral port via
 `--config` (your real `config.json` is never modified), then verifies:
-de-duplication of `ProxyHandler` methods, `GET /` → `OK`, the `/api/tags` stub
+de-duplication of `ProxyHandler` methods, `GET /` → `root_response` (default `OK`), the `/api/tags` stub
 (non-admin sees exactly the forced model; admin sees the full list), rate limiting
 (429 after 20/min), 401/403 handling, and that killing a streaming client frees its
 concurrency slot within ~5s with a `client-disconnected` log line.
@@ -113,7 +114,7 @@ Manual smoke test:
 
 ```bash
 python3 proxy.py &
-curl -s http://127.0.0.1:11435/                    # → OK, text/plain
+curl -s http://127.0.0.1:11435/                    # → root_response (default OK), text/plain
 curl -s http://127.0.0.1:11435/api/tags            # → single llama3.2 entry
 curl -s -X POST http://127.0.0.1:11435/api/generate \
   -d '{"model":"gemma4:e2b","prompt":"say hi","stream":true}' & sleep 1
