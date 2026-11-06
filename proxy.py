@@ -75,6 +75,20 @@ if ROOT_RESPONSE is None:
     ROOT_RESPONSE = "OK"
 elif not isinstance(ROOT_RESPONSE, str):
     ROOT_RESPONSE = str(ROOT_RESPONSE)
+# Path serving the local status page (handled locally, not proxied, so it
+# works even when Ollama is down). Obscure by default; set to any top-level
+# path outside /api/ /v1/ (e.g. "/proxy-status") in config.json.
+STATUS_PATH = CONFIG.get("status_path", "/proxy-status")
+if not isinstance(STATUS_PATH, str):
+    STATUS_PATH = "/proxy-status"
+else:
+    STATUS_PATH = STATUS_PATH.strip()
+    if not STATUS_PATH:
+        STATUS_PATH = "/proxy-status"
+    elif not STATUS_PATH.startswith("/"):
+        STATUS_PATH = "/" + STATUS_PATH
+    if STATUS_PATH in ("/", "/api", "/v1"):
+        STATUS_PATH = "/proxy-status"
 # Cap verbose logs: only log security-relevant events by default, not health checks.
 LOG_PATHS = set(CONFIG.get("log_paths")) if CONFIG.get("log_paths") else None  # None = log all
 
@@ -82,7 +96,7 @@ LOG_PATHS = set(CONFIG.get("log_paths")) if CONFIG.get("log_paths") else None  #
 # Invalid paths are dropped nginx-444 style (close with no reply) and never
 # reach upstream, auth, rate-limit, or the concurrency gate. Three signals
 # are combined in is_probe(): known probe extensions/patterns, over-long
-# paths, and a strict /api/ | /v1/ prefix (plus / and /status).
+# paths, and a strict /api/ | /v1/ prefix (plus / and the status path).
 MAX_PATH_LENGTH = int(CONFIG.get("max_path_length", 100))
 BLOCKED_EXTENSIONS = tuple(x.lower() for x in CONFIG.get(
     "blocked_probe_extensions",
@@ -100,8 +114,8 @@ PROBE_COLLAPSE_AFTER_SECONDS = float(
 _gate_sem = threading.BoundedSemaphore(MAX_CONCURRENT)
 _gate_lock = threading.RLock()  # RLock: helpers like _inc_busy nest inside lock sections
 _gate_waiters = 0
-_gate_busy = 0  # requests currently inside upstream (for /status)
-# Per-request detail for the /status page: the same requests counted by
+_gate_busy = 0  # requests currently inside upstream (for the status page)
+# Per-request detail for the status page: the same requests counted by
 # _gate_busy/_gate_waiters, with method/path/tier/client + timing so the
 # page shows *what* is running/queued, not just how many.
 _gate_running = []  # entries holding a slot (inside upstream)
@@ -125,7 +139,7 @@ def _remove_gate_entry(entries, entry):
 
 
 def _gate_snapshot():
-    """Atomic (busy, queued, running-copy, queued-copy) for /status.
+    """Atomic (busy, queued, running-copy, queued-copy) for the status page.
 
     Running copies gain "elapsed" (seconds since the slot was taken);
     queued copies gain "position" (1-based arrival order) and "waiting"
@@ -217,7 +231,7 @@ def is_obviously_a_probe(path: str) -> bool:
 
 def is_valid_ollama(path: str) -> bool:
     """Only locally-served names plus /api/ and /v1/ ever proxy upstream."""
-    if path in ("/", "/status", "/api", "/v1"):
+    if path in ("/", STATUS_PATH, "/api", "/v1"):
         return True
     if path.startswith("/api/") or path.startswith("/v1/"):
         return True
@@ -399,11 +413,11 @@ def get_tier(headers):
 # --- global sliding-window rate limiter ---
 # Single bucket for all anonymous+standard traffic, regardless of source IP or key.
 # (Per-IP/per-key buckets were misleading behind Tailscale serve/funnel, where
-# every client looks like 127.0.0.1, and leaked raw keys on /status.)
+# every client looks like 127.0.0.1, and leaked raw keys on the status page.)
 _hits = deque()
 _hits_lock = threading.Lock()
 
-# --- observability for /status page ---
+# --- observability for the status page ---
 _START_TIME = time.time()
 _stats_lock = threading.RLock()  # RLock: _record -> _collapse_old_404s nests
 # Placeholders keep probe volume visible without one dict entry per
@@ -537,12 +551,13 @@ def _record(path, tier, status, duration):
 
 
 def _rate_snapshot():
+    """(used, limit) for the single global window (anonymous+standard)."""
     now = time.monotonic()
     with _hits_lock:
-        # Non-destructive count: GET /status shouldn't mutate the limiter.
+        # Non-destructive count: GET <status_path> shouldn't mutate the limiter.
         # Only rate_limited() prunes expired starts.
         used = sum(1 for t in _hits if now - t <= 60)
-    return [{"identity": "global", "used": used, "limit": RATE_LIMIT}]
+    return used, RATE_LIMIT
 
 
 def rate_limited():
@@ -583,7 +598,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         return peer
 
     def _client_label(self):
-        """Display label for logs /status: Tailscale login + IP when available.
+        """Display label for logs / the status page: Tailscale login + IP when available.
 
         Prefer Tailscale-User-Login (tailnet serve only) because it's a stable
         human identity vs a 100.x IP. Same loopback-only trust rule as _client_ip.
@@ -703,7 +718,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return True  # lightweight info endpoint: no slot taken
         global _gate_waiters
         # One entry per gated request, tracked in _gate_running/_gate_queued
-        # (and removed by _handle via release_slot) so /status shows detail.
+        # (and removed by _handle via release_slot) so the status page shows detail.
         entry = {
             "method": self.command,
             "path": path,
@@ -797,7 +812,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         start = time.monotonic()
         # Status page is handled locally (not proxied) so it works even when Ollama is down.
-        if self.path.split("?", 1)[0] == "/status" and self.command == "GET":
+        if self.path.split("?", 1)[0] == STATUS_PATH and self.command == "GET":
             self._serve_status()
             return
         # Stub /api/tags locally: non-admins only ever see the forced model.
@@ -852,7 +867,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Concurrency gate: hold a slot for the whole upstream exchange.
         # Universal — every tier (admin/unlimited/standard/anonymous) queues here;
         # only lightweight GETs and POST /api/show skip it (path-based, see
-        # needs_gate), and /, /status, non-admin /api/tags stub never reach here.
+        # needs_gate), and /, the status page, non-admin /api/tags stub never reach here.
         if not self._enter_gate(path, tier):
             return
         try:
@@ -998,7 +1013,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         busy_now, queued_now, running_now, queued_list = _gate_snapshot()
 
-        rate_rows = _rate_snapshot()
+        rate_used, rate_limit = _rate_snapshot()
+        rate_limited_now = rate_used >= rate_limit
         keys = load_keys()
         tiers = defaultdict(int)
         for tier in keys.values():
@@ -1030,12 +1046,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             f"<td>{esc(r['tier'])}</td><td>{esc(r['duration'])}s</td></tr>"
             for r in recent
         ) or "<tr><td colspan=6>no requests yet</td></tr>"
-        rate_html_rows = "".join(
-            f"<tr><td>{esc(r['identity'])}</td><td>{r['used']}/{r['limit']}</td>"
-            f"<td class={'hot' if r['used'] >= r['limit'] else ''}>"
-            f"{'LIMITED' if r['used'] >= r['limit'] else 'ok'}</td></tr>"
-            for r in rate_rows
-        ) or "<tr><td colspan=3>no active rate-limit windows</td></tr>"
         tier_key_rows = "".join(
             f"<tr><td>{esc(t)}</td><td>{n}</td></tr>" for t, n in sorted(tiers.items())
         ) or "<tr><td colspan=2>no API keys configured</td></tr>"
@@ -1079,7 +1089,7 @@ table{{border-collapse:collapse;min-width:280px}} td,th{{border:1px solid #ccc;p
 <div class="card"><b>{busy_now}</b><span>running now</span></div>
 <div class="card"><b>{queued_now}</b><span>queued now</span></div>
 <div class="card"><b>{queue_rejected}</b><span>queue rejected (503)</span></div>
-<div class="card"><b>{RATE_LIMIT}/min</b><span>rate limit</span></div>
+<div class="card"><b class="{'hot' if rate_limited_now else ''}">{rate_used}/{rate_limit}</b><span>global rate limit (this minute){' · LIMITED' if rate_limited_now else ''}</span></div>
 <div class="card"><b>{limited}</b><span>rate-limited (429)</span></div>
 <div class="card"><b>{blocked}</b><span>blocked pulls (403)</span></div>
 <div class="card"><b>{invalid}</b><span>invalid keys (401)</span></div>
@@ -1098,8 +1108,6 @@ table{{border-collapse:collapse;min-width:280px}} td,th{{border:1px solid #ccc;p
 <h2>Requests by status</h2><table>{status_rows}</table>
 <h2>Requests by tier</h2><table>{tier_rows}</table>
 <h2>Requests by path</h2><table>{path_rows}</table>
-<h2>Rate-limit window (current minute)</h2>
-<table><tr><th>Scope</th><th>Used</th><th>State</th></tr>{rate_html_rows}</table>
 <h2>API keys configured</h2><table><tr><th>Tier</th><th>Key count</th></tr>{tier_key_rows}</table>
 <p><small>Auto-refreshes every 10s. API keys are never displayed.</small></p>
 </body></html>"""
@@ -1123,5 +1131,6 @@ if __name__ == "__main__":
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
     print(f"ollama-front listening on {LISTEN_HOST}:{LISTEN_PORT}, "
           f"proxying to {UPSTREAM_HOST}:{UPSTREAM_PORT}, forcing model '{FORCED_MODEL}', "
-          f"concurrency={MAX_CONCURRENT}, queue={MAX_QUEUE}x{int(QUEUE_TIMEOUT)}s")
+          f"concurrency={MAX_CONCURRENT}, queue={MAX_QUEUE}x{int(QUEUE_TIMEOUT)}s, "
+          f"status_path={STATUS_PATH}")
     server.serve_forever()

@@ -5,6 +5,7 @@
   "listen_port": 11435,
   "forced_model": "llama3.2",
   "root_response": "OK",
+  "status_path": "/proxy-status",
   "rate_limit_per_minute": 20,
   "max_concurrent_requests": 10,
   "queue_timeout_seconds": 300,

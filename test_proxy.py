@@ -70,9 +70,9 @@ def http_post(url, data, headers=None, timeout=10):
         return None, {}, f"{type(e).__name__}: {e}".encode()
 
 
-def status_counts(base):
-    """Parse /status HTML → (running_now, queued_now); -1 if not found."""
-    _st, _, body = http_get(f"{base}/status", timeout=5)
+def status_counts(base, status_path="/proxy-status"):
+    """Parse status-page HTML → (running_now, queued_now); -1 if not found."""
+    _st, _, body = http_get(f"{base}{status_path}", timeout=5)
     txt = body.decode(errors="replace")
     m_run = re.search(r"<b>(\d+)</b><span>running now", txt)
     m_q = re.search(r"<b>(\d+)</b><span>queued now", txt)
@@ -196,6 +196,13 @@ def check_dedup():
     root_body = root_body.group(0) if root_body else ""
     check("§1 _serve_root serves ROOT_RESPONSE, no hardcoded b\"OK\"",
           "ROOT_RESPONSE" in root_body and 'b"OK"' not in root_body)
+    check("§1 status path from config (status_path)",
+          re.search(r'CONFIG\.get\(\s*"status_path"', src) is not None
+          and re.search(r"STATUS_PATH\s*=", src) is not None)
+    check("§1 status path defaults to /proxy-status",
+          '"/proxy-status"' in src and 'CONFIG.get("status_path", "/proxy-status")' in src)
+    check("§1 no hardcoded /status route (STATUS_PATH only)",
+          '"/status"' not in src and "STATUS_PATH" in src)
     check("§1 probe helpers (is_obviously_a_probe/is_valid_ollama/is_probe)",
           all(n in src for n in ("def is_obviously_a_probe",
                                  "def is_valid_ollama", "def is_probe")))
@@ -246,6 +253,18 @@ def main():
     elif not isinstance(_root_cfg, str):
         _root_cfg = str(_root_cfg)
     expected_root = _root_cfg.encode("utf-8")
+    # Status page path: from config (same default as proxy.py), not hardcoded.
+    _status_cfg = config.get("status_path", "/proxy-status")
+    if not isinstance(_status_cfg, str):
+        status_path = "/proxy-status"
+    else:
+        status_path = _status_cfg.strip()
+        if not status_path:
+            status_path = "/proxy-status"
+        elif not status_path.startswith("/"):
+            status_path = "/" + status_path
+        if status_path in ("/", "/api", "/v1"):
+            status_path = "/proxy-status"
 
     # Verify upstream is reachable (proxy warms cache from it).
     st, _, body = http_get(f"http://{upstream_host}:{upstream_port}/api/tags", timeout=5)
@@ -307,10 +326,14 @@ def main():
               b"Ollama is running" not in body)
 
         # Status page sanity
-        st, _, body = http_get(f"{base}/status")
-        check("§4 /status 200 HTML", st == 200 and b"ollama-front status" in body,
+        st, _, body = http_get(f"{base}{status_path}")
+        check(f"§4 {status_path} 200 HTML", st == 200 and b"ollama-front status" in body,
               f"status={st} len={len(body)}")
         status_before = body.decode(errors="replace")
+        # The old hardcoded /status route is gone unless config points at it.
+        if status_path != "/status":
+            st_old, _, _ = http_get(f"{base}/status")
+            check("§4 old /status dropped (probe 444)", st_old is None, f"got status={st_old}")
 
         print("=== §4 /api/tags stub ===")
         st, _, body = http_get(f"{base}/api/tags")
@@ -405,8 +428,8 @@ def main():
             st, _, _ = http_get(f"{base}{_probe}")
             check(f"§5 probe {_probe[:30]} dropped (no reply)",
                   st is None, f"got status={st}")
-        st, _, body = http_get(f"{base}/status")
-        check("§5 /status shows probes dropped (444)",
+        st, _, body = http_get(f"{base}{status_path}")
+        check(f"§5 {status_path} shows probes dropped (444)",
               st == 200 and b"probes dropped" in body,
               f"status={st}")
         # Legitimate paths still work after probes (no rate-limit burn).
@@ -438,7 +461,7 @@ def main():
             check("§2 streaming disconnect (skipped)", True, "SKIP")
         else:
             # Long-lived stream so the slot is still held when we check
-            # /status (short prompts can finish before the header read + 1s).
+            # the status page (short prompts can finish before the header read + 1s).
             payload = json.dumps({
                 "model": "gemma4:e2b",
                 "prompt": "Write a detailed 500-word essay about the history of computing, "
@@ -464,7 +487,7 @@ def main():
             except OSError:
                 pass
             time.sleep(1.0)
-            st, _, status_html = http_get(f"{base}/status")
+            st, _, status_html = http_get(f"{base}{status_path}")
             m = re.search(r"<b>(\d+)</b><span>running now", status_html.decode(errors="replace"))
             running_while = int(m.group(1)) if m else -1
             check("§2 slot held while stream open (running now ≥ 1)",
@@ -481,7 +504,7 @@ def main():
             # the next completed read — allow up to ~20s for the slot to free.
             for _ in range(80):
                 time.sleep(0.25)
-                st, _, html_ = http_get(f"{base}/status")
+                st, _, html_ = http_get(f"{base}{status_path}")
                 m = re.search(r"<b>(\d+)</b><span>running now", html_.decode(errors="replace"))
                 if m and int(m.group(1)) == 0:
                     freed_within = True
@@ -530,7 +553,7 @@ def main():
                     blocker_sock = send_generate_sock(port2, blocker_payload, admin_key)
                     read_http_headers(blocker_sock)
                     time.sleep(1.0)
-                    running, queued = status_counts(base2)
+                    running, queued = status_counts(base2, status_path)
                     check("§2q slot held by blocker (running=1)", running == 1,
                           f"running={running} queued={queued}")
                     # Survivor: stays connected, queued behind blocker, then runs.
@@ -562,7 +585,7 @@ def main():
                     survivor_thread.start()
                     queued_seen = -1
                     for _ in range(12):
-                        running, queued = status_counts(base2)
+                        running, queued = status_counts(base2, status_path)
                         queued_seen = queued
                         if queued >= 1:
                             break
@@ -575,7 +598,7 @@ def main():
                     victim_sock = send_generate_sock(port2, victim_payload, admin_key)
                     queued_seen = -1
                     for _ in range(12):
-                        running, queued = status_counts(base2)
+                        running, queued = status_counts(base2, status_path)
                         queued_seen = queued
                         if queued >= 2:
                             break
@@ -586,7 +609,7 @@ def main():
                     hard_close(victim_sock)
                     queued_after = -1
                     for _ in range(20):
-                        running, queued = status_counts(base2)
+                        running, queued = status_counts(base2, status_path)
                         queued_after = queued
                         if queued == 1:
                             break
@@ -611,7 +634,7 @@ def main():
                           log2[-500:] if "queued-disconnected" not in log2 else "")
                     # Counts should settle back to idle.
                     for _ in range(20):
-                        running, queued = status_counts(base2)
+                        running, queued = status_counts(base2, status_path)
                         if running == 0 and queued == 0:
                             break
                         time.sleep(0.25)

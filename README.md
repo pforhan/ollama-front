@@ -8,10 +8,11 @@ Reverse proxy in front of your local Ollama instance with:
 - **Probe mitigation** — before auth, rate-limit, gate, or upstream, paths
   are validated: blocked extensions (`.php`, `.env`, `.git`, …) and prefixes
   (`/wp-admin`, `/admin`, `/cgi-bin`, …), a strict `max_path_length`
-  (default 100), and a strict prefix (`/`, `/status`, `/api/`, `/v1/` only).
+  (default 100), and a strict prefix (`/`, the status page path
+  (default `/proxy-status`), `/api/`, `/v1/` only).
   Probes get an nginx-style `444` drop (connection closed, no reply) and
   never reach Ollama. Dropped probes and stale (default 10-minute-old)
-  upstream `404`s collapse into single placeholder lines on `/status`, so
+  upstream `404`s collapse into single placeholder lines on the status page, so
   scans can't fill request history or requests-by-path.
 - **Rate limiting** — `rate_limit_per_minute` (default **20**/min, anonymous + `standard`
   keys) as a **single global sliding window** (request starts, regardless of source IP or key).
@@ -28,7 +29,7 @@ Reverse proxy in front of your local Ollama instance with:
 - **Serialized concurrency** — at most `max_concurrent_requests` run inside Ollama at
   once (tune in `config.json`; production value is **1**); extra requests wait in a
   bounded queue (`max_queue_size`, `queue_timeout_seconds`) and get `503` when
-  full/timed out, counted as `queue rejected` on `/status`. **Every tier queues** —
+  full/timed out, counted as `queue rejected` on the status page. **Every tier queues** —
   `admin`/`unlimited`/`standard`/anonymous alike (API key grants no queue exemption).
   Lightweight GETs (`/`, `/api/version`, `/api/ps`, `/api/tags`, `/v1/models`) plus
   `POST /api/show` skip the gate entirely, regardless of tier. `POST /api/show` is info-only,
@@ -36,9 +37,9 @@ Reverse proxy in front of your local Ollama instance with:
 - **Client-disconnect handling** — streaming responses poll for a dead client
   before each blocking upstream read (`select` + `recv(MSG_PEEK)`), so if nobody is
   receiving, the proxy stops generating, closes the upstream connection, and releases
-  its concurrency slot immediately (`running now` on `/status` drops within ~1s).
+  its concurrency slot immediately (`running now` on the status page drops within ~1s).
   The request log gets a `client-disconnected` suffix.
-- **`/status` live view** — besides totals and history, the status page lists the
+- **`status_path` live view** (default `/proxy-status`) — besides totals and history, the status page lists the
   requests currently running inside Ollama and currently queued (method, path,
   tier, client, elapsed/waiting time, queue position), plus slot/queue occupancy
   against `max_concurrent_requests` / `max_queue_size`. Client shows the real source
@@ -126,7 +127,7 @@ curl -s http://127.0.0.1:11435/                    # → root_response (default 
 curl -s http://127.0.0.1:11435/api/tags            # → single llama3.2 entry
 curl -s -X POST http://127.0.0.1:11435/api/generate \
   -d '{"model":"gemma4:e2b","prompt":"say hi","stream":true}' & sleep 1
-curl -s http://127.0.0.1:11435/status | grep -E "running now|queued now"
+curl -s http://127.0.0.1:11435/proxy-status | grep -E "running now|queued now"
 # (kill the first curl) then re-check: running now back to 0 quickly
 for i in $(seq 1 25); do curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:11435/api/tags; done
 # note: /api/tags stub is answered before the rate limiter; expect 429 on proxied paths instead
