@@ -4,6 +4,7 @@
   "listen_host": "0.0.0.0",
   "listen_port": 11435,
   "forced_model": "llama3.2",
+  "reported_context_length": 32768,
   "root_response": "OK",
   "status_path": "/proxy-status",
   "rate_limit_per_minute": 20,

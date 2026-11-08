@@ -56,6 +56,17 @@ LISTEN_HOST = CONFIG["listen_host"]
 LISTEN_PORT = CONFIG["listen_port"]
 FORCED_MODEL = CONFIG["forced_model"]
 RATE_LIMIT = CONFIG["rate_limit_per_minute"]
+# When set, cap the context window this proxy reports (e.g. /api/show
+# model_info.*.context_length) and defensively cap options.num_ctx in
+# forwarded requests, so clients don't ask a small machine for more than it
+# can handle. 0/null/absent = no override (report what upstream reports).
+_rc = CONFIG.get("reported_context_length")
+try:
+    REPORTED_CONTEXT_LENGTH = int(_rc) if _rc else 0
+except (TypeError, ValueError):
+    REPORTED_CONTEXT_LENGTH = 0
+if REPORTED_CONTEXT_LENGTH < 0:
+    REPORTED_CONTEXT_LENGTH = 0
 BLOCKED_DOWNLOAD_PATHS = set(CONFIG.get("blocked_download_paths",
                              ["/api/pull", "/api/create", "/api/copy", "/api/delete", "/api/push"]))
 STUB_TAGS = CONFIG.get("stub_tags", True)  # answer /api/tags + /v1/models locally (blocked model only)
@@ -424,6 +435,46 @@ MODEL_BODY_PATHS = (
     "/v1/completions",
     "/v1/embeddings",
 )
+
+# /api/chat and /api/generate accept options.num_ctx; cap to
+# REPORTED_CONTEXT_LENGTH when set so small machines aren't asked to exceed
+# their limit (clients often pick num_ctx from the reported context).
+_NUM_CTX_BODY_PATHS = {
+    "/api/generate", "/api/chat", "/api/embed", "/api/embeddings",
+    "/v1/chat/completions", "/v1/completions", "/v1/embeddings",
+}
+
+
+def _cap_num_ctx(payload):
+    """Cap options.num_ctx in-place when REPORTED_CONTEXT_LENGTH is set."""
+    if not REPORTED_CONTEXT_LENGTH or not isinstance(payload, dict):
+        return
+    opts = payload.get("options")
+    if isinstance(opts, dict):
+        n = opts.get("num_ctx")
+        if isinstance(n, (int, float)) and n > REPORTED_CONTEXT_LENGTH:
+            opts["num_ctx"] = REPORTED_CONTEXT_LENGTH
+
+
+def _rewrite_show_context(payload):
+    """Cap reported context fields in an /api/show response in-place."""
+    if not REPORTED_CONTEXT_LENGTH or not isinstance(payload, dict):
+        return
+    cap = REPORTED_CONTEXT_LENGTH
+    info = payload.get("model_info")
+    if isinstance(info, dict):
+        for k, v in list(info.items()):
+            if k.endswith(".context_length") and isinstance(v, (int, float)) and v > cap:
+                info[k] = cap
+    # Best-effort: cap a rendered num_ctx in parameters/modelfile text.
+    import re as _re
+    for key in ("parameters", "modelfile"):
+        text = payload.get(key)
+        if isinstance(text, str) and "num_ctx" in text:
+            payload[key] = _re.sub(
+                r'((?:num_ctx\s+)|(?:PARAMETER\s+num_ctx\s+))(\d+)',
+                lambda m: m.group(1) + str(min(int(m.group(2)), cap)),
+                text)
 
 _keys_lock = threading.Lock()
 _keys_cache = {"mtime": 0, "data": {}}
@@ -967,13 +1018,27 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if not self._enter_gate(path, tier):
             return
         try:
-            # Force model for non-admins.
+            # Force model for non-admins; cap requested num_ctx when configured.
             if tier != "admin" and body and path in MODEL_BODY_PATHS:
                 try:
                     payload = json.loads(body)
                     if isinstance(payload, dict):
                         payload["model"] = FORCED_MODEL
+                        if path in _NUM_CTX_BODY_PATHS:
+                            _cap_num_ctx(payload)
                         body = json.dumps(payload).encode()
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    pass
+            elif REPORTED_CONTEXT_LENGTH and body and path in _NUM_CTX_BODY_PATHS:
+                # Admin/unhandled: still cap num_ctx to protect this machine.
+                try:
+                    payload = json.loads(body)
+                    if isinstance(payload, dict):
+                        before = json.dumps(payload.get("options", {}).get("num_ctx"))
+                        _cap_num_ctx(payload)
+                        after = json.dumps(payload.get("options", {}).get("num_ctx"))
+                        if before != after:
+                            body = json.dumps(payload).encode()
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     pass
 
@@ -1020,21 +1085,33 @@ class ProxyHandler(BaseHTTPRequestHandler):
                           f"transfer-encoding={resp.getheader('Transfer-Encoding')!r}", flush=True)
 
                 self._status = resp.status
-                self.send_response(resp.status)
                 content_length = resp.getheader("Content-Length")
-                for k, v in resp.getheaders():
-                    if k.lower() in ("transfer-encoding", "connection", "content-length"):
-                        continue
-                    self.send_header(k, v)
-                if content_length is not None:
-                    self.send_header("Content-Length", content_length)
-                else:
-                    self.send_header("Transfer-Encoding", "chunked")
-                self.end_headers()
                 try:
                     if content_length is not None:
+                        # Buffer so we can rewrite (e.g. /api/show context cap).
                         try:
-                            self.wfile.write(resp.read())
+                            raw = resp.read()
+                        except (http.client.HTTPException, OSError):
+                            raw = b""
+                        out = raw
+                        if REPORTED_CONTEXT_LENGTH and path == "/api/show" and tier != "admin":
+                            ctype = (resp.getheader("Content-Type") or "").lower()
+                            if "json" in ctype or not ctype or raw[:1] in (b"{", b"["):
+                                try:
+                                    payload = json.loads(raw)
+                                    _rewrite_show_context(payload)
+                                    out = json.dumps(payload).encode()
+                                except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+                                    out = raw
+                        self.send_response(resp.status)
+                        for k, v in resp.getheaders():
+                            if k.lower() in ("transfer-encoding", "connection", "content-length"):
+                                continue
+                            self.send_header(k, v)
+                        self.send_header("Content-Length", str(len(out)))
+                        self.end_headers()
+                        try:
+                            self.wfile.write(out)
                         except (BrokenPipeError, ConnectionResetError, OSError):
                             self._client_gone = True
                     else:
@@ -1043,6 +1120,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         # disconnect (and enforce an overall deadline) even when
                         # upstream is silent — resp.read() would otherwise block for
                         # the full socket timeout and defeat _is_client_alive().
+                        self.send_response(resp.status)
+                        for k, v in resp.getheaders():
+                            if k.lower() in ("transfer-encoding", "connection", "content-length"):
+                                continue
+                            self.send_header(k, v)
+                        self.send_header("Transfer-Encoding", "chunked")
+                        self.end_headers()
                         client_dead = False
                         sock = getattr(conn, "sock", None)
                         deadline = time.monotonic() + 600

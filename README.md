@@ -26,7 +26,10 @@ Reverse proxy in front of your local Ollama instance with:
   they are blocked instead.
 - **Forced model** — non-admin requests to generate/chat/embed and `/api/show` have their
   `model` field rewritten to the configured `forced_model` (default `llama3.2`), so
-  `/api/show` can only ever read the forced model.
+  `/api/show` can only ever read the forced model. When `reported_context_length` is set
+  (e.g. `32768`), the proxy caps reported context in `/api/show` (`model_info.*.context_length`)
+  and defensively caps `options.num_ctx` in forwarded requests so clients don’t ask the
+  machine for more context than it can handle. `0`/unset = report upstream as-is.
 - **Serialized concurrency** — at most `max_concurrent_requests` run inside Ollama at
   once (tune in `config.json`; production value is **1**); extra requests wait in a
   bounded queue (`max_queue_size`, `queue_timeout_seconds`) and get `503` when
