@@ -10,12 +10,6 @@ to Ollama at `127.0.0.1:11434`.
 
 ## Ollama features
 
-### Liveness endpoint
-
-`GET /` returns a plain-text response (`root_response`, default `OK`) without
-calling upstream, without auth/rate-limit checks, and without using a
-concurrency slot. The upstream "Ollama is running" text is not forwarded.
-
 ### Forced model
 
 For non-admin requests, the proxy rewrites the `model` field on
