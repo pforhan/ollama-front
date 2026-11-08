@@ -2,11 +2,11 @@
 
 A reverse proxy in front of a local [Ollama](https://ollama.com/) instance. It
 adds access control, request shaping, and operational visibility so you can
-safely expose Ollama (for example, via Tailscale Funnel) without giving callers
-unrestricted control over the machine.
+safely expose a single model from Ollama without giving callers unrestricted
+control over the machine.
 
-By default the proxy listens on `0.0.0.0:11435` and forwards to Ollama at
-`127.0.0.1:11434`.
+By default the proxy listens on `0.0.0.0:11435` (all interfaces) and forwards
+to Ollama at `127.0.0.1:11434`.
 
 ## Ollama features
 
@@ -112,6 +112,14 @@ exposed proxy does not accept forged headers.
 
 ## Probe mitigation
 
+### Custom root message
+
+`GET /` returns a plain-text response (`root_response`, default `OK`) without
+calling upstream, without auth/rate-limit checks, and without using a
+concurrency slot. The upstream `Ollama is running` text is not forwarded.
+
+### Path validation
+
 Before auth, rate limiting, queueing, or upstream forwarding, the proxy
 validates request paths. Requests that look like scans/probes are dropped with
 an nginx-style `444` response (connection closed, no reply) and never reach
@@ -133,6 +141,8 @@ counts.
 
 ```bash
 python3 proxy.py
+python3 proxy.py --config /path/to/config.json
+OLLAMA_FRONT_CONFIG=/path/to/config.json python3 proxy.py
 ```
 
 Or install as a service (auto-detects Linux + systemd vs. macOS + launchd):
@@ -150,10 +160,15 @@ Or install as a service (auto-detects Linux + systemd vs. macOS + launchd):
 answers on its listen port. On unsupported systems it warns and shows how to run
 `proxy.py` manually.
 
+### Configuration
+
 Edit `config.json` to change ports, the forced model, rate limits, queueing, or
 other behavior.
 
-### Alternate config
+See [the configuration example](config.json.example) for all the default settings. These
+values are used if no `config.json` exists.
+
+#### Alternate config
 
 You can select a config file at launch without modifying the default file:
 
@@ -180,17 +195,14 @@ reloaded automatically when it changes; no restart is needed.
 
 ## Expose with Tailscale Funnel
 
+A handy usage for this proxy is to connect to a tailscale funnel so you can 
+access an ollama instance from anywhere.
+
 ```bash
 sudo tailscale funnel --bg 11435
 ```
 
 Then use `https://<your-machine>.<tailnet>.ts.net` as your Ollama base URL.
-
-Behind `tailscale serve`/`funnel`, `tailscaled` connects over loopback, so the
-raw TCP peer is always `127.0.0.1`. The proxy recovers the real source IP from
-`X-Forwarded-For` (and `Tailscale-User-Login` for tailnet serve) **only** when
-the peer is loopback. Raw TCP forwarding (`tailscale serve --tcp=443`) carries
-no identity header and does not preserve the source IP.
 
 ## Testing
 
@@ -204,15 +216,3 @@ python3 test_proxy.py --upstream-port 11434
 (your real `config.json` is not modified) and verifies core behavior including
 the root response, forced-model tag stubs, rate limiting, auth handling, and
 that killing a streaming client releases its concurrency slot promptly.
-
-Manual smoke test:
-
-```bash
-python3 proxy.py &
-curl -s http://127.0.0.1:11435/                     # root_response (default OK)
-curl -s http://127.0.0.1:11435/api/tags             # forced-model stub for non-admins
-curl -s -X POST http://127.0.0.1:11435/api/generate \
-  -d '{"model":"gemma4:e2b","prompt":"say hi","stream":true}' & sleep 1
-curl -s http://127.0.0.1:11435/proxy-status | grep -E "running now|queued now"
-# kill the streaming curl, then re-check: running now should drop quickly
-```
