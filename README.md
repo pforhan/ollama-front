@@ -1,64 +1,133 @@
 # ollama-front
 
-Reverse proxy in front of your local Ollama instance with:
+A reverse proxy in front of a local [Ollama](https://ollama.com/) instance. It
+adds access control, request shaping, and operational visibility so you can
+safely expose Ollama (for example, via Tailscale Funnel) without giving callers
+unrestricted control over the machine.
 
-- **`GET /` → `root_response`** — plain-text `root_response` (default `OK`) as a
-  liveness probe, no upstream call, no gate, no
-  auth/rate-limit. (Your upstream's "Ollama is running" text is suppressed.)
-- **Probe mitigation** — before auth, rate-limit, gate, or upstream, paths
-  are validated: blocked extensions (`.php`, `.env`, `.git`, …) and prefixes
-  (`/wp-admin`, `/admin`, `/cgi-bin`, …), a strict `max_path_length`
-  (default 100), and a strict prefix (`/`, the status page path
-  (default `/proxy-status`), `/api/`, `/v1/` only).
-  Probes get an nginx-style `444` drop (connection closed, no reply) and
-  never reach Ollama. Recent request history shows the rejected path
-  for `probe_collapse_after_seconds` (default 10 minutes), then
-  collapses stale entries into a single placeholder line, so
-  scans can't fill request history or requests-by-path.
-- **Rate limiting** — `rate_limit_per_minute` (default **20**/min, anonymous + `standard`
-  keys) as a **single global sliding window** (request starts, regardless of source IP or key).
-  `admin`/`unlimited` are exempt from the `429`, but not from the queue. Abandoned/
-  disconnected requests still consume quota — they are counted before the gate and
-  upstream, with no refund on disconnect.
-- **Blocked mutations** — `/api/pull`, `/api/create`, `/api/copy`, `/api/delete`,
-  `/api/push` and `/api/blobs/*` are disabled for everyone except `admin` keys
-  (403). They carry arbitrary model names/digests, so forcing makes no sense —
-  they are blocked instead.
-- **Forced model** — non-admin requests to generate/chat/embed and `/api/show` have their
-  `model` field rewritten to the configured `forced_model` (default `llama3.2`), so
-  `/api/show` can only ever read the forced model. When `reported_context_length` is set
-  (e.g. `32768`), the proxy caps reported context in `/api/show` (`model_info.*.context_length`)
-  and defensively caps `options.num_ctx` in forwarded requests so clients don’t ask the
-  machine for more context than it can handle. `0`/unset = report upstream as-is.
-- **Serialized concurrency** — at most `max_concurrent_requests` run inside Ollama at
-  once (tune in `config.json`; production value is **1**); extra requests wait in a
-  bounded queue (`max_queue_size`, `queue_timeout_seconds`) and get `503` when
-  full/timed out, counted as `queue rejected` on the status page. **Every tier queues** —
-  `admin`/`unlimited`/`standard`/anonymous alike (API key grants no queue exemption).
-  Lightweight GETs (`/`, `/api/version`, `/api/ps`, `/api/tags`, `/v1/models`) plus
-  `POST /api/show` skip the gate entirely, regardless of tier. `POST /api/show` is info-only,
-  like `/api/tags` — it never runs inference.
-- **Client-disconnect handling** — streaming responses poll for a dead client
-  before each blocking upstream read (`select` + `recv(MSG_PEEK)`), so if nobody is
-  receiving, the proxy stops generating, closes the upstream connection, and releases
-  its concurrency slot immediately (`running now` on the status page drops within ~1s).
-  The request log gets a `client-disconnected` suffix.
-- **`status_path` live view** (default `/proxy-status`) — besides totals and history, the status page lists the
-  requests currently running inside Ollama and currently queued (method, path,
-  tier, client, elapsed/waiting time, queue position), plus slot/queue occupancy
-  against `max_concurrent_requests` / `max_queue_size`. Client shows the real source
-  IP (or Tailscale login) when behind `tailscale serve`/`funnel` — see below.
-- **`/api/tags` + `/v1/models` stubs** — at startup the proxy fetches the full tag list from Ollama
-  (Ollama has no per-model filter), extracts **only the forced model's real entry**, and
-  caches it. Non-admins always get that single cached entry — instant, no Ollama
-  roundtrip, and never revealing other (blocked) models. `/v1/models` and
-  `/v1/models/:id` (OpenAI-compatible) are stubbed the same way, and refresh every
-  `tags_cache_refresh_seconds` (default 300s). Admins get the real lists.
-- **API-key tiers** (see `api_keys.json.example`):
-  - `admin` — no rate limit, no model forcing, can pull/create/copy/delete/push models (still queues)
-  - `unlimited` — no rate limit; model still forced, downloads still blocked (still queues)
-  - `standard` — full restrictions
-  - no key — treated as `standard`
+By default the proxy listens on `0.0.0.0:11435` and forwards to Ollama at
+`127.0.0.1:11434`.
+
+## Ollama features
+
+### Liveness endpoint
+
+`GET /` returns a plain-text response (`root_response`, default `OK`) without
+calling upstream, without auth/rate-limit checks, and without using a
+concurrency slot. The upstream "Ollama is running" text is not forwarded.
+
+### Forced model
+
+For non-admin requests, the proxy rewrites the `model` field on
+generate/chat/embed requests and `POST /api/show` to the configured
+`forced_model` (default `llama3.2`). This prevents callers from selecting other
+local models.
+
+When `reported_context_length` is set (for example, `32768`), the proxy:
+
+- caps reported context in `/api/show` (`model_info.*.context_length`), and
+- defensively caps `options.num_ctx` on forwarded requests.
+
+Set `reported_context_length` to `0` or leave it unset to report upstream
+context as-is.
+
+### Blocked model-management mutations
+
+The following endpoints are disabled for everyone except `admin` API keys
+(returns `403`):
+
+- `/api/pull`
+- `/api/create`
+- `/api/copy`
+- `/api/delete`
+- `/api/push`
+- `/api/blobs/*`
+
+These operations carry arbitrary model names/digests and are blocked rather than
+model-forced.
+
+### Model list stubs
+
+For non-admin callers, `/api/tags`, `/v1/models`, and `/v1/models/:id` return a
+cached entry for **only** the forced model. At startup the proxy fetches the
+full tag list from Ollama, extracts the forced model's entry, and refreshes the
+cache every `tags_cache_refresh_seconds` (default `300`). This avoids revealing
+other local models and avoids an upstream roundtrip for common discovery calls.
+
+Admins receive the real upstream model lists.
+
+### Concurrency and queueing
+
+Ollama requests that can consume inference resources are serialized through a
+bounded gate:
+
+- `max_concurrent_requests` — requests allowed to run inside Ollama at once
+- `max_queue_size` — maximum waiting requests
+- `queue_timeout_seconds` — how long a request may wait in the queue
+
+When the queue is full or a request times out waiting, the proxy returns `503`.
+**All tiers queue**, including `admin` and `unlimited`; API keys do not bypass
+the queue.
+
+Lightweight requests skip the gate entirely, regardless of tier: `GET /`,
+`/api/version`, `/api/ps`, `/api/tags`, `/v1/models`, and `POST /api/show`.
+
+### Rate limiting
+
+`rate_limit_per_minute` (default `20`) applies as a single global sliding
+window across request starts, regardless of source IP or API key.
+`admin` and `unlimited` keys are exempt from `429` responses, but they are not
+exempt from queueing. Abandoned/disconnected requests still consume quota.
+
+### API key tiers
+
+API keys are defined in `api_keys.json` as `{"tier": ["key1", "key2"]}`.
+Clients send a key with `Authorization: Bearer <key>` or the `X-API-Key`
+header. Requests without a key are treated as `standard`.
+
+| Tier | Rate limit exempt | Model forced | Model mutations allowed | Queues |
+| --- | ---: | ---: | ---: | ---: |
+| `admin` | Yes | No | Yes | Yes |
+| `unlimited` | Yes | Yes | No | Yes |
+| `standard` | No | Yes | No | Yes |
+| no key | No | Yes | No | Yes |
+
+## Status page
+
+The status page (default path: `/proxy-status`) provides a live operational view,
+including:
+
+- request totals and recent request history
+- requests currently running inside Ollama
+- requests currently queued
+- slot/queue occupancy against `max_concurrent_requests` / `max_queue_size`
+
+For active and queued requests it shows method, path, tier, client,
+elapsed/waiting time, and queue position.
+
+When running behind `tailscale serve`/`funnel`, the proxy reports the real
+source IP (or Tailscale login) instead of loopback. It trusts forwarded
+identity headers only when the direct peer is `127.0.0.1`/`::1`; a directly
+exposed proxy does not accept forged headers.
+
+## Probe mitigation
+
+Before auth, rate limiting, queueing, or upstream forwarding, the proxy
+validates request paths. Requests that look like scans/probes are dropped with
+an nginx-style `444` response (connection closed, no reply) and never reach
+Ollama.
+
+Validation includes:
+
+- blocked file extensions (for example `.php`, `.env`, `.git`)
+- blocked path prefixes (for example `/wp-admin`, `/admin`, `/cgi-bin`)
+- a strict `max_path_length` (default `100`)
+- a strict allowed-path policy (`/`, the status page path, `/api/`, `/v1/`)
+
+Recent rejected probe paths are retained in request history for
+`probe_collapse_after_seconds` (default 10 minutes), then collapsed into a
+single placeholder line so scans do not dominate request history or per-path
+counts.
 
 ## Run it
 
@@ -76,32 +145,38 @@ Or install as a service (auto-detects Linux + systemd vs. macOS + launchd):
 ./install.sh --uninstall        # remove the service
 ```
 
-`install.sh` renders the unit/plist from the current checkout path, user,
-and `python3`, checks for `config.json` / `api_keys.json`, and verifies the
-proxy answers on its listen port. On unsupported systems it warns and shows
-how to run `proxy.py` manually — see `TODO(expand)` in `install.sh` for where
-to add another platform.
+`install.sh` renders the unit/plist from the current checkout path, user, and
+`python3`, checks for `config.json` / `api_keys.json`, and verifies the proxy
+answers on its listen port. On unsupported systems it warns and shows how to run
+`proxy.py` manually.
 
-The proxy listens on `0.0.0.0:11435` and forwards to Ollama on `127.0.0.1:11434`.
-Edit `config.json` to change ports, the forced model, or the rate limit.
+Edit `config.json` to change ports, the forced model, rate limits, queueing, or
+other behavior.
 
 ### Alternate config
 
-The config path can be chosen at launch without touching the file on disk:
+You can select a config file at launch without modifying the default file:
 
 ```bash
 python3 proxy.py --config /path/to/config.json
 OLLAMA_FRONT_CONFIG=/path/to/config.json python3 proxy.py
 ```
 
-Resolution order: `--config` flag, then `OLLAMA_FRONT_CONFIG` env var, then
-`config.json` next to `proxy.py`. Useful for tests — see below.
+Resolution order: `--config`, then `OLLAMA_FRONT_CONFIG`, then `config.json`
+next to `proxy.py`.
 
 ## API keys
 
-Copy `api_keys.json.example` to `api_keys.json` and edit. Format is `{"tier": ["key1", "key2"]}`.
-Clients send the key via `Authorization: Bearer <key>` or the `X-API-Key` header.
-The file is reloaded automatically when it changes — no restart needed.
+Copy `api_keys.json.example` to `api_keys.json` and edit it. The file is
+reloaded automatically when it changes; no restart is needed.
+
+```json
+{
+  "admin": ["replace-with-admin-key"],
+  "unlimited": ["replace-with-unlimited-key"],
+  "standard": ["replace-with-standard-key"]
+}
+```
 
 ## Expose with Tailscale Funnel
 
@@ -111,37 +186,33 @@ sudo tailscale funnel --bg 11435
 
 Then use `https://<your-machine>.<tailnet>.ts.net` as your Ollama base URL.
 
-> Behind `tailscale serve`/`funnel`, `tailscaled` connects over loopback, so the raw
-> TCP peer is always `127.0.0.1`. The proxy recovers the real source IP from
-> `X-Forwarded-For` (and `Tailscale-User-Login` for tailnet serve) **only** when the
-> peer is `127.0.0.1`/`::1` — a directly-exposed proxy won't accept forged headers.
-> `tailscale serve --tcp=443` (raw TCP) carries no header and loses the source IP.
+Behind `tailscale serve`/`funnel`, `tailscaled` connects over loopback, so the
+raw TCP peer is always `127.0.0.1`. The proxy recovers the real source IP from
+`X-Forwarded-For` (and `Tailscale-User-Login` for tailnet serve) **only** when
+the peer is loopback. Raw TCP forwarding (`tailscale serve --tcp=443`) carries
+no identity header and does not preserve the source IP.
 
 ## Testing
 
 ```bash
-python3 test_proxy.py            # full run, including the streaming disconnect test
-python3 test_proxy.py --skip-stream
+python3 test_proxy.py                  # full run
+python3 test_proxy.py --skip-stream    # skip streaming disconnect test
 python3 test_proxy.py --upstream-port 11434
 ```
 
-`test_proxy.py` starts its own throwaway proxy on an ephemeral port via
-`--config` (your real `config.json` is never modified), then verifies:
-de-duplication of `ProxyHandler` methods, `GET /` → `root_response` (default `OK`), the `/api/tags` stub
-(non-admin sees exactly the forced model; admin sees the full list), rate limiting
-(429 after 20/min), 401/403 handling, and that killing a streaming client frees its
-concurrency slot within ~5s with a `client-disconnected` log line.
+`test_proxy.py` starts a throwaway proxy on an ephemeral port using `--config`
+(your real `config.json` is not modified) and verifies core behavior including
+the root response, forced-model tag stubs, rate limiting, auth handling, and
+that killing a streaming client releases its concurrency slot promptly.
 
 Manual smoke test:
 
 ```bash
 python3 proxy.py &
-curl -s http://127.0.0.1:11435/                    # → root_response (default OK), text/plain
-curl -s http://127.0.0.1:11435/api/tags            # → single llama3.2 entry
+curl -s http://127.0.0.1:11435/                     # root_response (default OK)
+curl -s http://127.0.0.1:11435/api/tags             # forced-model stub for non-admins
 curl -s -X POST http://127.0.0.1:11435/api/generate \
   -d '{"model":"gemma4:e2b","prompt":"say hi","stream":true}' & sleep 1
 curl -s http://127.0.0.1:11435/proxy-status | grep -E "running now|queued now"
-# (kill the first curl) then re-check: running now back to 0 quickly
-for i in $(seq 1 25); do curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:11435/api/tags; done
-# note: /api/tags stub is answered before the rate limiter; expect 429 on proxied paths instead
+# kill the streaming curl, then re-check: running now should drop quickly
 ```
