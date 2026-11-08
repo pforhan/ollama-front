@@ -179,14 +179,6 @@ next to `proxy.py`.
 Copy `api_keys.json.example` to `api_keys.json` and edit it. The file is
 reloaded automatically when it changes; no restart is needed.
 
-```json
-{
-  "admin": ["replace-with-admin-key"],
-  "unlimited": ["replace-with-unlimited-key"],
-  "standard": ["replace-with-standard-key"]
-}
-```
-
 ## Expose with Tailscale Funnel
 
 A handy usage for this proxy is to connect to a tailscale funnel so you can 
