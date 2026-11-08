@@ -218,6 +218,59 @@ def _is_blocked_path(path):
     return False
 
 
+def _read_chunked_body(rfile, limit=None):
+    """Decode an HTTP/1.1 chunked request body. Returns bytes or None on error.
+
+    BaseHTTPRequestHandler does not decode Transfer-Encoding: chunked, so
+    clients that send chunked request bodies (common with some JVM HTTP
+    libraries) would otherwise be forwarded with an empty/missing body."""
+    chunks = []
+    total = 0
+    while True:
+        line = rfile.readline()
+        if not line:
+            return None
+        # strip chunk extensions (";ext=...") and CRLF
+        size_str = line.split(b";", 1)[0].strip()
+        try:
+            size = int(size_str, 16)
+        except ValueError:
+            return None
+        if size == 0:
+            # consume trailer headers + terminating CRLF
+            while True:
+                trailer = rfile.readline()
+                if not trailer or trailer in (b"\r\n", b"\n"):
+                    break
+            break
+        if limit is not None and total + size > limit:
+            return None
+        data = rfile.read(size)
+        if len(data) != size:
+            return None
+        chunks.append(data)
+        total += size
+        # consume CRLF after chunk data
+        rfile.readline()
+    return b"".join(chunks)
+
+
+def _read_request_body(handler, limit=100 * 1024 * 1024):
+    """Read request body, handling Content-Length and chunked encoding."""
+    te = (handler.headers.get("Transfer-Encoding") or "").lower()
+    if "chunked" in te:
+        return _read_chunked_body(handler.rfile, limit=limit)
+    try:
+        length = int(handler.headers.get("Content-Length") or 0)
+    except ValueError:
+        length = 0
+    if length <= 0:
+        return None
+    if length > limit:
+        return None
+    return handler.rfile.read(length)
+
+
 # --- probe mitigation helpers ---
 # Path passed to these helpers is expected to be query-stripped
 # (self.path.split("?", 1)[0]) — callers in _handle do that once.
@@ -904,8 +957,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._respond(429, {"error": f"rate limit exceeded ({RATE_LIMIT}/min)"})
                 return
 
-        length = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(length) if length else None
+        body = _read_request_body(self)
+        self._body_consumed = True
 
         # Concurrency gate: hold a slot for the whole upstream exchange.
         # Universal — every tier (admin/unlimited/standard/anonymous) queues here;
@@ -924,70 +977,115 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     pass
 
+            # Strip hop-by-hop/framing headers. In particular, if we decoded a
+            # chunked request body we send it upstream with Content-Length, so a
+            # forwarded Transfer-Encoding: chunked would conflict and can hang
+            # or confuse upstream (Ollama). Expect is also handled locally.
+            _drop = ("host", "content-length", "connection", "transfer-encoding",
+                     "expect", "keep-alive", "proxy-authorization", "te", "trailer", "upgrade")
             headers = {k: v for k, v in self.headers.items()
-                       if k.lower() not in ("host", "content-length", "connection")}
+                       if k.lower() not in _drop}
             if body is not None:
                 headers["Content-Length"] = str(len(body))
 
+            te_in = self.headers.get("Transfer-Encoding", "")
+            cl_in = self.headers.get("Content-Length", "")
+            body_len = len(body) if body else 0
+            upstream_detail = ""
+            if LOG_REQUESTS:
+                print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {self._client_label()} "
+                      f"UPSTREAM-REQ {self.command} {path} cl_in={cl_in!r} te_in={te_in!r} "
+                      f"body_read={body_len} fwd_headers={sorted(headers.keys())}", flush=True)
+            resp = None
+            conn = None
             try:
                 conn = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=600)
                 conn.request(self.command, self.path, body=body, headers=headers)
                 resp = conn.getresponse()
             except (ConnectionRefusedError, OSError) as e:
                 self._status = 502
+                upstream_detail = f" upstream-error={e!r}"
                 self._respond(502, {"error": f"upstream unavailable: {e}"})
-                return
-
-            self._status = resp.status
-            self.send_response(resp.status)
-            content_length = resp.getheader("Content-Length")
-            for k, v in resp.getheaders():
-                if k.lower() in ("transfer-encoding", "connection", "content-length"):
-                    continue
-                self.send_header(k, v)
-            if content_length is not None:
-                self.send_header("Content-Length", content_length)
-            else:
-                self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
-            try:
-                if content_length is not None:
+                if conn is not None:
                     try:
-                        self.wfile.write(resp.read())
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        self._client_gone = True
+                        conn.close()
+                    except Exception:
+                        pass
+                resp = None
+            if resp is not None:
+                if LOG_REQUESTS:
+                    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {self._client_label()} "
+                          f"UPSTREAM-RESP {self.command} {path} -> {resp.status} "
+                          f"content-length={resp.getheader('Content-Length')!r} "
+                          f"transfer-encoding={resp.getheader('Transfer-Encoding')!r}", flush=True)
+
+                self._status = resp.status
+                self.send_response(resp.status)
+                content_length = resp.getheader("Content-Length")
+                for k, v in resp.getheaders():
+                    if k.lower() in ("transfer-encoding", "connection", "content-length"):
+                        continue
+                    self.send_header(k, v)
+                if content_length is not None:
+                    self.send_header("Content-Length", content_length)
                 else:
-                    # Stream (chunked input from upstream); re-chunk to client.
-                    # Poll for client disconnect before each blocking read so an
-                    # abandoned stream frees its slot promptly instead of waiting
-                    # for the next write to fail or generation to finish.
-                    client_dead = False
-                    while True:
-                        if not self._is_client_alive():
-                            client_dead = True
-                            break
-                        chunk = resp.read(8192)
-                        if not chunk:
-                            break
-                        self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
-                        self.wfile.flush()
-                    if not client_dead:
-                        self.wfile.write(b"0\r\n\r\n")
-                        self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                # Client went away mid-response. Record it, then abort the upstream
-                # connection so Ollama stops generating for nobody. The `finally`
-                # below releases the concurrency slot immediately.
-                self._client_gone = True
-            finally:
-                conn.close()
+                    self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                try:
+                    if content_length is not None:
+                        try:
+                            self.wfile.write(resp.read())
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            self._client_gone = True
+                    else:
+                        # Stream (chunked input from upstream); re-chunk to client.
+                        # Read with a short socket timeout so we can poll for client
+                        # disconnect (and enforce an overall deadline) even when
+                        # upstream is silent — resp.read() would otherwise block for
+                        # the full socket timeout and defeat _is_client_alive().
+                        client_dead = False
+                        sock = getattr(conn, "sock", None)
+                        deadline = time.monotonic() + 600
+                        poll = 1.0
+                        while True:
+                            if not self._is_client_alive():
+                                client_dead = True
+                                break
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError("upstream stream timed out")
+                            if sock is not None:
+                                try:
+                                    sock.settimeout(min(poll, remaining))
+                                except OSError:
+                                    pass
+                            try:
+                                chunk = resp.read(8192)
+                            except (socket.timeout, TimeoutError):
+                                continue
+                            if not chunk:
+                                break
+                            self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                            self.wfile.flush()
+                        if not client_dead:
+                            self.wfile.write(b"0\r\n\r\n")
+                            self.wfile.flush()
+                except (http.client.HTTPException, BrokenPipeError, ConnectionResetError, OSError):
+                    # Client went away mid-response, or upstream stream errored/timed
+                    # out (IncompleteRead, socket timeout, etc.). Abort the upstream
+                    # connection so Ollama stops generating for nobody. The `finally`
+                    # below releases the concurrency slot immediately.
+                    self._client_gone = True
+                finally:
+                    if conn is not None:
+                        conn.close()
         finally:
             if self._holds_slot:
                 release_slot(self._gate_entry)
                 self._gate_entry = None
                 self._holds_slot = False
         duration = time.monotonic() - start
-        self._log(path, tier, f" {round(duration, 3)}s")
+        self._log(path, tier, f" {round(duration, 3)}s{upstream_detail}")
         _record(path, tier, self._status, duration)
         # keep method in recent-request record
         with _stats_lock:
@@ -998,12 +1096,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _respond(self, status, obj):
         # Drain any unread request body so it isn't parsed as a new request.
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-            if length:
-                self.rfile.read(length)
-        except (ValueError, OSError):
-            pass
+        # Skip if the body was already consumed by _handle.
+        if not getattr(self, "_body_consumed", False):
+            try:
+                _read_request_body(self)
+            except (ValueError, OSError):
+                pass
         data = json.dumps(obj).encode()
         try:
             self.send_response(status)
