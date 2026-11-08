@@ -8,7 +8,7 @@
   "root_response": "OK",
   "status_path": "/proxy-status",
   "rate_limit_per_minute": 20,
-  "max_concurrent_requests": 10,
+  "max_concurrent_requests": 1,
   "queue_timeout_seconds": 300,
   "max_queue_size": 20,
   "stub_tags": true,
