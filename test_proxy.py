@@ -222,6 +222,17 @@ def check_dedup():
     check("§1 probe history retains actual path (stored_path, _PROBE_PLACEHOLDER collapse)",
           "stored_path = path[:MAX_PATH_LENGTH]" in src
           and "old_probe" in src and "_PROBE_PLACEHOLDER" in src)
+    check("§1 model context rewrite helper (_rewrite_model_context)",
+          "def _rewrite_model_context" in src)
+    rewrite_gate = re.search(r"REPORTED_CONTEXT_LENGTH and tier != \"admin\" and \((.*?)\):",
+                             src, re.S)
+    rewrite_gate = rewrite_gate.group(1) if rewrite_gate else ""
+    check("§1 proxied model stats rewrite covers show/tags/v1/models",
+          all(p in rewrite_gate for p in ('/api/show', '/api/tags', '/v1/models', '/v1/models/'))
+          and "_rewrite_model_context(payload)" in src)
+    check("§1 stubs rewrite model context when configured",
+          "_serve_stub_tags" in src and "_serve_stub_v1_models" in src
+          and src.count("_rewrite_model_context(entry)") >= 3)
     r = subprocess.run([sys.executable, "-m", "py_compile", os.path.join(BASE, "proxy.py")],
                        capture_output=True, text=True)
     check("§1 py_compile", r.returncode == 0, r.stderr.strip()[:300])
@@ -235,6 +246,64 @@ def check_dedup():
             break
 
 
+def check_reported_context_rewrite():
+    """Unit checks for reported_context_length model-stats rewriting."""
+    # Import from repo dir so proxy resolves config.json next to itself.
+    old_cwd = os.getcwd()
+    os.chdir(BASE)
+    try:
+        if BASE not in sys.path:
+            sys.path.insert(0, BASE)
+        import proxy
+    except Exception as e:
+        check("§1c import proxy for context rewrite tests", False, repr(e))
+        os.chdir(old_cwd)
+        return
+    finally:
+        os.chdir(old_cwd)
+
+    old_cap = proxy.REPORTED_CONTEXT_LENGTH
+    try:
+        proxy.REPORTED_CONTEXT_LENGTH = 4096
+
+        show = {
+            "model_info": {"llama.context_length": 131072, "general.architecture": "llama"},
+            "parameters": "num_ctx 8192\nstop foo",
+            "modelfile": "FROM x\nPARAMETER num_ctx 8192\n",
+        }
+        proxy._rewrite_model_context(show)
+        check("§1c /api/show model_info.*.context_length capped",
+              show["model_info"]["llama.context_length"] == 4096
+              and show["model_info"]["general.architecture"] == "llama")
+        check("§1c /api/show parameters/modelfile num_ctx capped",
+              "num_ctx 4096" in show["parameters"]
+              and "PARAMETER num_ctx 4096" in show["modelfile"])
+
+        tags = {"models": [{"name": "m", "model_info": {"x.context_length": 99999}}]}
+        proxy._rewrite_model_context(tags)
+        check("§1c /api/tags wrapper model stats capped",
+              tags["models"][0]["model_info"]["x.context_length"] == 4096)
+
+        v1 = {"object": "list", "data": [{"id": "m", "model_info": {"x.context_length": 99999}}]}
+        proxy._rewrite_model_context(v1)
+        check("§1c /v1/models wrapper model stats capped",
+              v1["data"][0]["model_info"]["x.context_length"] == 4096)
+
+        no_cap = {"model_info": {"x.context_length": 2048}, "parameters": "num_ctx 2048"}
+        proxy._rewrite_model_context(no_cap)
+        check("§1c values below cap unchanged",
+              no_cap["model_info"]["x.context_length"] == 2048
+              and "num_ctx 2048" in no_cap["parameters"])
+
+        proxy.REPORTED_CONTEXT_LENGTH = 0
+        off = {"model_info": {"x.context_length": 99999}}
+        proxy._rewrite_model_context(off)
+        check("§1c rewrite disabled when reported_context_length unset/0",
+              off["model_info"]["x.context_length"] == 99999)
+    finally:
+        proxy.REPORTED_CONTEXT_LENGTH = old_cap
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-stream", action="store_true", help="skip slow streaming disconnect test")
@@ -243,6 +312,7 @@ def main():
 
     print("=== §1 de-duplication ===")
     check_dedup()
+    check_reported_context_rewrite()
 
     config = json.load(open(os.path.join(BASE, "config.json")))
     forced = config["forced_model"]

@@ -456,11 +456,26 @@ def _cap_num_ctx(payload):
             opts["num_ctx"] = REPORTED_CONTEXT_LENGTH
 
 
-def _rewrite_show_context(payload):
-    """Cap reported context fields in an /api/show response in-place."""
-    if not REPORTED_CONTEXT_LENGTH or not isinstance(payload, dict):
+def _rewrite_model_context(payload):
+    """Cap reported context fields in model metadata payloads in-place.
+
+    Handles /api/show responses (model_info.*.context_length, num_ctx in
+    parameters/modelfile) and tag/model-list wrappers (models[], data[]), so
+    reported max context stays consistent with config.json's reported_context_length.
+    """
+    if not REPORTED_CONTEXT_LENGTH or not isinstance(payload, (dict, list)):
         return
     cap = REPORTED_CONTEXT_LENGTH
+    if isinstance(payload, list):
+        for item in payload:
+            _rewrite_model_context(item)
+        return
+    # Wrappers used by /api/tags and /v1/models.
+    for key in ("models", "data"):
+        items = payload.get(key)
+        if isinstance(items, list):
+            for item in items:
+                _rewrite_model_context(item)
     info = payload.get("model_info")
     if isinstance(info, dict):
         for k, v in list(info.items()):
@@ -794,6 +809,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             entry = {"name": FORCED_MODEL, "model": FORCED_MODEL,
                      "modified_at": "2026-01-01T00:00:00Z", "size": 0, "digest": "",
                      "details": {"family": "stub", "parameter_size": ""}}
+        elif REPORTED_CONTEXT_LENGTH:
+            entry = json.loads(json.dumps(entry))
+            _rewrite_model_context(entry)
         self._status = 200
         self._respond(200, {"models": [entry]})
 
@@ -802,6 +820,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if entry is None:
             entry = {"id": FORCED_MODEL, "object": "model",
                      "created": 0, "owned_by": "library"}
+        elif REPORTED_CONTEXT_LENGTH:
+            entry = json.loads(json.dumps(entry))
+            _rewrite_model_context(entry)
         self._status = 200
         self._respond(200, {"object": "list", "data": [entry]})
 
@@ -811,6 +832,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if entry is None:
             entry = {"id": FORCED_MODEL, "object": "model",
                      "created": 0, "owned_by": "library"}
+        elif REPORTED_CONTEXT_LENGTH:
+            entry = json.loads(json.dumps(entry))
+            _rewrite_model_context(entry)
         self._status = 200
         self._respond(200, entry)
 
@@ -1094,12 +1118,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         except (http.client.HTTPException, OSError):
                             raw = b""
                         out = raw
-                        if REPORTED_CONTEXT_LENGTH and path == "/api/show" and tier != "admin":
+                        if REPORTED_CONTEXT_LENGTH and tier != "admin" and (
+                            path == "/api/show" or path == "/api/tags" or
+                            path == "/v1/models" or path.startswith("/v1/models/")
+                        ):
                             ctype = (resp.getheader("Content-Type") or "").lower()
                             if "json" in ctype or not ctype or raw[:1] in (b"{", b"["):
                                 try:
                                     payload = json.loads(raw)
-                                    _rewrite_show_context(payload)
+                                    _rewrite_model_context(payload)
                                     out = json.dumps(payload).encode()
                                 except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                                     out = raw

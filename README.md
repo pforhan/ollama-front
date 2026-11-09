@@ -19,7 +19,9 @@ local models.
 
 When `reported_context_length` is set (for example, `32768`), the proxy:
 
-- caps reported context in `/api/show` (`model_info.*.context_length`), and
+- caps reported context in model stats/metadata for non-admins, including
+  `/api/show` (`model_info.*.context_length`, rendered `num_ctx`),
+  `/api/tags`, and `/v1/models` responses/stubs, and
 - defensively caps `options.num_ctx` on forwarded requests.
 
 Set `reported_context_length` to `0` or leave it unset to report upstream
