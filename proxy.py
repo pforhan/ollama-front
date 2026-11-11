@@ -45,6 +45,7 @@ _CONFIG_DEFAULTS = {
     "blocked_probe_extensions": [".php", ".asp", ".aspx", ".jsp", ".env", ".yaml", ".yml", ".git"],
     "blocked_probe_paths": ["/wp-admin", "/admin", "/cgi-bin", "/phpmyadmin", "/.well-known"],
     "probe_collapse_after_seconds": 600,
+    "keep_alive": "5m",
 }
 
 
@@ -520,6 +521,19 @@ _NUM_CTX_BODY_PATHS = {
 # Fixed /api/version payload to avoid leaking the real Ollama/server version.
 FIXED_VERSION = {"version": "0.0.0"}
 
+# Keep-alive value supplied to upstream for non-admin requests (client value ignored).
+KEEP_ALIVE = CONFIG.get("keep_alive", _CONFIG_DEFAULTS["keep_alive"])
+
+# Request option keys allowed for non-admins (others dropped).
+_ALLOWED_OPTION_KEYS = {"num_ctx", "temperature", "top_p", "top_k", "seed", "stop", "num_predict"}
+
+# Ollama response timing fields in nanoseconds; rounded up to nearest 10s for non-admins.
+_RESPONSE_TIMING_FIELDS = ("total_duration", "load_duration", "prompt_eval_duration", "eval_duration")
+_ROUND_TIMING_NS = 10_000_000_000  # 10 seconds in nanoseconds
+
+# Endpoints that accept a top-level keep_alive field.
+_KEEP_ALIVE_BODY_PATHS = {"/api/generate", "/api/chat", "/api/embed", "/api/embeddings"}
+
 # Fields in model metadata that can leak build details, prompts, or local paths.
 _SENSITIVE_MODEL_FIELDS = ("license", "modelfile", "template", "system")
 
@@ -533,6 +547,43 @@ def _cap_num_ctx(payload):
         n = opts.get("num_ctx")
         if isinstance(n, (int, float)) and n > REPORTED_CONTEXT_LENGTH:
             opts["num_ctx"] = REPORTED_CONTEXT_LENGTH
+
+
+def _sanitize_request_options(payload):
+    """For non-admins, drop hardware/memory option flags and keep only allowed keys."""
+    if not isinstance(payload, dict):
+        return
+    opts = payload.get("options")
+    if not isinstance(opts, dict):
+        return
+    payload["options"] = {k: v for k, v in opts.items() if k in _ALLOWED_OPTION_KEYS}
+
+
+def _set_keep_alive(payload, path):
+    """Ignore client keep_alive and supply configured constant for non-admin requests."""
+    if not isinstance(payload, dict) or path not in _KEEP_ALIVE_BODY_PATHS:
+        return
+    payload["keep_alive"] = KEEP_ALIVE
+
+
+def _round_up_to_10s_ns(value):
+    """Round a nanosecond duration up to the nearest 10 seconds."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return value
+    if v <= 0:
+        return v
+    return ((v + _ROUND_TIMING_NS - 1) // _ROUND_TIMING_NS) * _ROUND_TIMING_NS
+
+
+def _round_response_timings(payload):
+    """Round Ollama timing fields up to nearest 10s for non-admin responses."""
+    if not isinstance(payload, dict):
+        return
+    for key in _RESPONSE_TIMING_FIELDS:
+        if key in payload:
+            payload[key] = _round_up_to_10s_ns(payload[key])
 
 
 def _rewrite_model_context(payload):
@@ -1225,14 +1276,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if not self._enter_gate(path, tier):
             return
         try:
-            # Force model for non-admins; cap requested num_ctx when configured.
+            # Force model, restrict options, and override keep_alive for non-admins;
+            # cap requested num_ctx when configured.
             if tier != "admin" and body and path in MODEL_BODY_PATHS:
                 try:
                     payload = json.loads(body)
                     if isinstance(payload, dict):
                         payload["model"] = FORCED_MODEL
                         if path in _NUM_CTX_BODY_PATHS:
+                            _sanitize_request_options(payload)
                             _cap_num_ctx(payload)
+                        _set_keep_alive(payload, path)
+                        body = json.dumps(payload).encode()
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    pass
+            elif tier != "admin" and body and path in _KEEP_ALIVE_BODY_PATHS:
+                # Non-model endpoints that still accept keep_alive: enforce constant.
+                try:
+                    payload = json.loads(body)
+                    if isinstance(payload, dict) and "keep_alive" in payload:
+                        _set_keep_alive(payload, path)
                         body = json.dumps(payload).encode()
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     pass
@@ -1295,24 +1358,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 content_length = resp.getheader("Content-Length")
                 try:
                     if content_length is not None:
-                        # Buffer so we can rewrite (e.g. /api/show context cap).
+                        # Buffer so we can rewrite (e.g. /api/show context cap, timings).
                         try:
                             raw = resp.read()
                         except (http.client.HTTPException, OSError):
                             raw = b""
                         out = raw
-                        if tier != "admin" and (
-                            path == "/api/show" or path == "/api/tags" or
-                            path == "/v1/models" or path.startswith("/v1/models/")
-                        ):
+                        if tier != "admin":
                             ctype = (resp.getheader("Content-Type") or "").lower()
                             if "json" in ctype or not ctype or raw[:1] in (b"{", b"["):
                                 try:
                                     payload = json.loads(raw)
-                                    if REPORTED_CONTEXT_LENGTH:
-                                        _rewrite_model_context(payload)
-                                    # Strip modelfile/license/template/system to limit telemetry.
-                                    _sanitize_model_info(payload)
+                                    if path == "/api/show" or path == "/api/tags" or \
+                                       path == "/v1/models" or path.startswith("/v1/models/"):
+                                        if REPORTED_CONTEXT_LENGTH:
+                                            _rewrite_model_context(payload)
+                                        _sanitize_model_info(payload)
+                                    # Round timing fields in responses for non-admins.
+                                    _round_response_timings(payload)
                                     out = json.dumps(payload).encode()
                                 except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                                     out = raw
@@ -1344,6 +1407,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         sock = getattr(conn, "sock", None)
                         deadline = time.monotonic() + 600
                         poll = 1.0
+                        line_buf = b""
+                        rewrite_stream = (tier != "admin")
                         while True:
                             if not self._is_client_alive():
                                 client_dead = True
@@ -1362,7 +1427,36 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                 continue
                             if not chunk:
                                 break
-                            self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                            if rewrite_stream:
+                                line_buf += chunk
+                                while b"\n" in line_buf:
+                                    line, line_buf = line_buf.split(b"\n", 1)
+                                    out_line = line
+                                    stripped = line.strip()
+                                    if stripped.startswith(b"{"):
+                                        try:
+                                            payload = json.loads(line)
+                                            _round_response_timings(payload)
+                                            out_line = json.dumps(payload).encode()
+                                        except Exception:
+                                            out_line = line
+                                    send_chunk = out_line + b"\n"
+                                    self.wfile.write(b"%x\r\n%s\r\n" % (len(send_chunk), send_chunk))
+                                    self.wfile.flush()
+                            else:
+                                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                                self.wfile.flush()
+                        if rewrite_stream and line_buf and not client_dead:
+                            out_line = line_buf
+                            stripped = line_buf.strip()
+                            if stripped.startswith(b"{"):
+                                try:
+                                    payload = json.loads(line_buf)
+                                    _round_response_timings(payload)
+                                    out_line = json.dumps(payload).encode()
+                                except Exception:
+                                    out_line = line_buf
+                            self.wfile.write(b"%x\r\n%s\r\n" % (len(out_line), out_line))
                             self.wfile.flush()
                         if not client_dead:
                             self.wfile.write(b"0\r\n\r\n")

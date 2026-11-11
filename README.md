@@ -132,6 +132,15 @@ To reduce fingerprinting and information disclosure:
   configured context-length capping. This removes local paths, embedded prompts,
   and license text that can help fingerprint the model; `admin` requests are not
   sanitized.
+- For non-admin responses, Ollama timing fields (`total_duration`,
+  `load_duration`, `prompt_eval_duration`, `eval_duration`) are rounded up to
+  the nearest 10 seconds to reduce precise performance fingerprinting.
+- For non-admin requests, `options` are restricted to `num_ctx`, `temperature`,
+  `top_p`, `top_k`, `seed`, `stop`, and `num_predict`; other hardware/memory
+  tuning flags are dropped.
+- For non-admin requests, client-supplied `keep_alive` is ignored and replaced
+  with the configured constant (`keep_alive`, default `5m`). Admin requests are
+  forwarded unchanged.
 
 ### Custom root message
 
