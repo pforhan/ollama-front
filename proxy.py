@@ -27,6 +27,51 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
+# Default values for config.json keys (single source of truth for minimizing).
+# Keys absent from this mapping are required and must stay in config.json.
+_CONFIG_DEFAULTS = {
+    "reported_context_length": 0,
+    "root_response": "OK",
+    "status_path": "/proxy-status",
+    "max_concurrent_requests": 1,
+    "queue_timeout_seconds": 300,
+    "max_queue_size": 20,
+    "stub_tags": True,
+    "tags_cache_refresh_seconds": 300,
+    "lightweight_paths": ["/", "/api/tags", "/api/version", "/api/ps", "/v1/models"],
+    "blocked_download_paths": ["/api/pull", "/api/create", "/api/copy", "/api/delete", "/api/push"],
+    "log_requests": True,
+    "max_path_length": 100,
+    "blocked_probe_extensions": [".php", ".asp", ".aspx", ".jsp", ".env", ".yaml", ".yml", ".git"],
+    "blocked_probe_paths": ["/wp-admin", "/admin", "/cgi-bin", "/phpmyadmin", "/.well-known"],
+    "probe_collapse_after_seconds": 600,
+}
+
+
+def minimize_config(config):
+    """Return config with keys equal to defaults removed (required keys kept)."""
+    return {k: v for k, v in config.items() if k not in _CONFIG_DEFAULTS or v != _CONFIG_DEFAULTS[k]}
+
+
+def _build_parser():
+    """CLI parser for proxy.py (also used by --help)."""
+    p = argparse.ArgumentParser(
+        prog="proxy.py",
+        description="Reverse proxy for Ollama with rate limiting, model forcing, and API-key tiers.",
+    )
+    p.add_argument("--config", metavar="PATH",
+                   help="config.json path (default: $OLLAMA_FRONT_CONFIG or ./config.json)")
+    p.add_argument("--minimize-config", nargs="?", const="", default=None, metavar="PATH",
+                   help="strip config keys equal to defaults; prints to stdout, or rewrites PATH in place")
+    return p
+
+
+def _parse_args(argv):
+    """Parse known args; -h/--help is handled by argparse itself."""
+    parser = _build_parser()
+    args, _unknown = parser.parse_known_args(argv)
+    return args
+
 
 def _resolve_config_path(argv=None):
     """Config path: --config PATH > $OLLAMA_FRONT_CONFIG > <script-dir>/config.json."""
@@ -45,8 +90,30 @@ def _resolve_config_path(argv=None):
     return BASE_DIR / "config.json"
 
 
-CONFIG_PATH = _resolve_config_path()
+# Parse CLI args first so -h/--help works even if config.json is missing/invalid.
+_cli = _parse_args(sys.argv[1:])
+if _cli.config:
+    CONFIG_PATH = Path(_cli.config).resolve()
+else:
+    CONFIG_PATH = _resolve_config_path(sys.argv[1:])
 KEYS_PATH = BASE_DIR / "api_keys.json"
+
+# Optional config minimization: `python proxy.py --minimize-config [path]`.
+# Prints the minimized JSON (defaults stripped) to stdout. If a path is given,
+# writes it back in place atomically; otherwise only prints.
+if _cli.minimize_config is not None:
+    _target = Path(_cli.minimize_config).resolve() if _cli.minimize_config else CONFIG_PATH
+    with _target.open() as _f:
+        _cfg = json.load(_f)
+    _out = json.dumps(minimize_config(_cfg), indent=2) + "\n"
+    if _cli.minimize_config:
+        _tmp = _target.with_name(_target.name + ".tmp")
+        _tmp.write_text(_out)
+        _tmp.replace(_target)
+        print(f"minimized {_target}", file=sys.stderr)
+    else:
+        sys.stdout.write(_out)
+    sys.exit(0)
 
 with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
@@ -61,7 +128,7 @@ RATE_LIMIT = CONFIG["rate_limit_per_minute"]
 # model_info.*.context_length) and defensively cap options.num_ctx in
 # forwarded requests, so clients don't ask a small machine for more than it
 # can handle. 0/null/absent = no override (report what upstream reports).
-_rc = CONFIG.get("reported_context_length")
+_rc = CONFIG.get("reported_context_length", _CONFIG_DEFAULTS["reported_context_length"])
 try:
     REPORTED_CONTEXT_LENGTH = int(_rc) if _rc else 0
 except (TypeError, ValueError):
@@ -69,38 +136,44 @@ except (TypeError, ValueError):
 if REPORTED_CONTEXT_LENGTH < 0:
     REPORTED_CONTEXT_LENGTH = 0
 BLOCKED_DOWNLOAD_PATHS = set(CONFIG.get("blocked_download_paths",
-                             ["/api/pull", "/api/create", "/api/copy", "/api/delete", "/api/push"]))
-STUB_TAGS = CONFIG.get("stub_tags", True)  # answer /api/tags + /v1/models locally (blocked model only)
-TAGS_CACHE_REFRESH_SECONDS = CONFIG.get("tags_cache_refresh_seconds", 300)  # background TTL (0 = startup only)
+                             _CONFIG_DEFAULTS["blocked_download_paths"]))
+STUB_TAGS = CONFIG.get("stub_tags", _CONFIG_DEFAULTS["stub_tags"])  # answer /api/tags + /v1/models locally
+TAGS_CACHE_REFRESH_SECONDS = CONFIG.get("tags_cache_refresh_seconds",
+                                        _CONFIG_DEFAULTS["tags_cache_refresh_seconds"])  # background TTL
 # Lightweight GETs that never load/run a model — they skip the concurrency gate.
 LIGHTWEIGHT_PATHS = set(CONFIG.get("lightweight_paths",
-                       ["/", "/api/tags", "/api/version", "/api/ps", "/v1/models"]))
+                       _CONFIG_DEFAULTS["lightweight_paths"]))
 # --- concurrency gate: serialize inference so a small box isn't oversubscribed ---
-MAX_CONCURRENT = int(CONFIG.get("max_concurrent_requests", 1))
-QUEUE_TIMEOUT = float(CONFIG.get("queue_timeout_seconds", 300))  # seconds to wait before 503
-MAX_QUEUE = int(CONFIG.get("max_queue_size", 20))                # max waiting requests before 503
+MAX_CONCURRENT = int(CONFIG.get("max_concurrent_requests", _CONFIG_DEFAULTS["max_concurrent_requests"]))
+QUEUE_TIMEOUT = float(CONFIG.get("queue_timeout_seconds", _CONFIG_DEFAULTS["queue_timeout_seconds"]))
+MAX_QUEUE = int(CONFIG.get("max_queue_size", _CONFIG_DEFAULTS["max_queue_size"]))
 GATE_POLL_INTERVAL = 0.5  # queued waiters re-check client liveness at this cadence
-LOG_REQUESTS = CONFIG.get("log_requests", True)
+LOG_REQUESTS = CONFIG.get("log_requests", _CONFIG_DEFAULTS["log_requests"])
 # Plain-text body served for GET / (liveness probe). Kept as a simple string.
-ROOT_RESPONSE = CONFIG.get("root_response", "OK")
+ROOT_RESPONSE = CONFIG.get("root_response", _CONFIG_DEFAULTS["root_response"])
 if ROOT_RESPONSE is None:
-    ROOT_RESPONSE = "OK"
+    ROOT_RESPONSE = _CONFIG_DEFAULTS["root_response"]
 elif not isinstance(ROOT_RESPONSE, str):
     ROOT_RESPONSE = str(ROOT_RESPONSE)
+# Browsers automatically request /favicon.ico for any HTML page. Serve it
+# locally with 204 No Content (there is no icon) instead of dropping it as a
+# probe or proxying it upstream. The status page also declares this via
+# <link rel="icon" href="data:,"> so browsers don't ask in the first place.
+FAVICON_PATHS = frozenset(("/favicon.ico",))
 # Path serving the local status page (handled locally, not proxied, so it
 # works even when Ollama is down). Obscure by default; set to any top-level
 # path outside /api/ /v1/ (e.g. "/proxy-status") in config.json.
-STATUS_PATH = CONFIG.get("status_path", "/proxy-status")
+STATUS_PATH = CONFIG.get("status_path", _CONFIG_DEFAULTS["status_path"])
 if not isinstance(STATUS_PATH, str):
-    STATUS_PATH = "/proxy-status"
+    STATUS_PATH = _CONFIG_DEFAULTS["status_path"]
 else:
     STATUS_PATH = STATUS_PATH.strip()
     if not STATUS_PATH:
-        STATUS_PATH = "/proxy-status"
+        STATUS_PATH = _CONFIG_DEFAULTS["status_path"]
     elif not STATUS_PATH.startswith("/"):
         STATUS_PATH = "/" + STATUS_PATH
     if STATUS_PATH in ("/", "/api", "/v1"):
-        STATUS_PATH = "/proxy-status"
+        STATUS_PATH = _CONFIG_DEFAULTS["status_path"]
 # Cap verbose logs: only log security-relevant events by default, not health checks.
 LOG_PATHS = set(CONFIG.get("log_paths")) if CONFIG.get("log_paths") else None  # None = log all
 
@@ -108,21 +181,20 @@ LOG_PATHS = set(CONFIG.get("log_paths")) if CONFIG.get("log_paths") else None  #
 # Invalid paths are dropped nginx-444 style (close with no reply) and never
 # reach upstream, auth, rate-limit, or the concurrency gate. Three signals
 # are combined in is_probe(): known probe extensions/patterns, over-long
-# paths, and a strict /api/ | /v1/ prefix (plus / and the status path).
-MAX_PATH_LENGTH = int(CONFIG.get("max_path_length", 100))
+# paths, and a strict /api/ | /v1/ prefix (plus /, the status path, and
+# /favicon.ico).
+MAX_PATH_LENGTH = int(CONFIG.get("max_path_length", _CONFIG_DEFAULTS["max_path_length"]))
 BLOCKED_EXTENSIONS = tuple(x.lower() for x in CONFIG.get(
-    "blocked_probe_extensions",
-    ['.php', '.asp', '.aspx', '.jsp', '.env', '.yaml', '.yml', '.git']))
+    "blocked_probe_extensions", _CONFIG_DEFAULTS["blocked_probe_extensions"]))
 BLOCKED_PATHS = tuple(x.lower() for x in CONFIG.get(
-    "blocked_probe_paths",
-    ['/wp-admin', '/admin', '/cgi-bin', '/phpmyadmin', '/.well-known']))
+    "blocked_probe_paths", _CONFIG_DEFAULTS["blocked_probe_paths"]))
 # After this age, individual 404 records and recent probe records
 # collapse into a single placeholder line so probe scans can't fill
 # _stats unboundedly (default 10 minutes). Recent (bounded deque of
 # 50) retains the actual probe path for this window so the owner can
 # see what was rejected; by_path stays aggregated immediately.
 PROBE_COLLAPSE_AFTER_SECONDS = float(
-    CONFIG.get("probe_collapse_after_seconds", 600))
+    CONFIG.get("probe_collapse_after_seconds", _CONFIG_DEFAULTS["probe_collapse_after_seconds"]))
 
 # --- concurrency gate: at most MAX_CONCURRENT requests run inside Ollama at once.
 # Exceeding requests wait in a bounded queue; overflows/timeouts get 503.
@@ -298,8 +370,8 @@ def is_obviously_a_probe(path: str) -> bool:
 
 
 def is_valid_ollama(path: str) -> bool:
-    """Only locally-served names plus /api/ and /v1/ ever proxy upstream."""
-    if path in ("/", STATUS_PATH, "/api", "/v1"):
+    """Locally-served paths (root, status page, favicon) plus /api/ and /v1/."""
+    if path in ("/", STATUS_PATH, "/api", "/v1") or path in FAVICON_PATHS:
         return True
     if path.startswith("/api/") or path.startswith("/v1/"):
         return True
@@ -915,6 +987,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             self._client_gone = True
 
+    def _serve_favicon(self):
+        """204 No Content: the proxy serves no favicon.
+
+        Browsers request /favicon.ico automatically for HTML pages. Answering
+        locally keeps that check out of the probe counter and off the
+        upstream; the status page declares the same via its icon link."""
+        self._status = 204
+        try:
+            self.send_response(204)
+            # 204 must not carry a body or Content-Length; close so HTTP/1.1
+            # clients don't wait for one.
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self._client_gone = True
+
     def _drop_probe(self, path):
         """Nginx-444: close with no reply, no Server hint, no upstream.
 
@@ -1032,6 +1122,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Probe mitigation, before auth / rate-limit / gate / upstream:
         # invalid paths get an nginx-444 drop (no reply, no upstream).
         _req_path = self.path.split("?", 1)[0]
+        path = _req_path
         if is_probe(_req_path):
             self._drop_probe(_req_path)
             return
@@ -1040,6 +1131,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if self.path.split("?", 1)[0] == "/" and self.command == "GET":
             self._serve_root()
             _record("/", "anonymous", 200, 0.0)
+            return
+        # Favicon check: browsers request /favicon.ico for any HTML page.
+        # Serve it locally with 204 so it is never dropped as a probe or
+        # proxied upstream. Also declared in the status page's <head>.
+        if _req_path in FAVICON_PATHS and self.command in ("GET", "HEAD"):
+            self._serve_favicon()
+            _record(_req_path, "anonymous", 204, 0.0)
             return
         # Status page is handled locally (admin-only). Supports browser Basic auth
         # (user "admin", password = any admin API key) and admin Bearer/X-API-Key.
@@ -1082,8 +1180,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 _record(path, tier0, 200, 0.0)
                 return
         key, tier = get_tier(self.headers)
-
-        path = self.path.split("?", 1)[0]
 
         if tier == "invalid":
             self._status = 401
@@ -1414,6 +1510,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         body = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <title>ollama-front status</title>
+<link rel="icon" href="data:,">
 <meta http-equiv="refresh" content="10">
 <style>
 body{{font-family:system-ui,sans-serif;margin:2rem;max-width:900px;line-height:1.4}}

@@ -52,20 +52,6 @@ other local models and avoids an upstream roundtrip for common discovery calls.
 
 Admins receive the real upstream model lists.
 
-### Telemetry lockdown
-
-To reduce fingerprinting and information disclosure:
-
-- `GET /api/version` returns a fixed response (`{"version":"0.0.0"}`) instead of
-  proxying the real upstream version.
-- `GET /api/ps` returns `{"models":[]}` for non-admin callers so running/loaded
-  model state is not exposed; `admin` API keys receive the real upstream
-  response.
-- `POST /api/show` responses for non-admin callers have sensitive metadata
-  stripped (`modelfile`, `license`, `template`, `system`) in addition to any
-  configured context-length capping. This removes local paths, embedded prompts,
-  and license text that can help fingerprint the model; `admin` requests are not
-  sanitized.
 
 ### Concurrency and queueing
 
@@ -105,6 +91,7 @@ header. Requests without a key are treated as `standard`.
 | `standard` | No | Yes | No | Yes |
 | no key | No | Yes | No | Yes |
 
+
 ## Status page
 
 The status page (default path: `/proxy-status`) provides a live operational view,
@@ -129,7 +116,22 @@ source IP (or Tailscale login) instead of loopback. It trusts forwarded
 identity headers only when the direct peer is `127.0.0.1`/`::1`; a directly
 exposed proxy does not accept forged headers.
 
-## Probe mitigation
+## Security
+
+### Telemetry lockdown
+
+To reduce fingerprinting and information disclosure:
+
+- `GET /api/version` returns a fixed response (`{"version":"0.0.0"}`) instead of
+  proxying the real upstream version.
+- `GET /api/ps` returns `{"models":[]}` for non-admin callers so running/loaded
+  model state is not exposed; `admin` API keys receive the real upstream
+  response.
+- `POST /api/show` responses for non-admin callers have sensitive metadata
+  stripped (`modelfile`, `license`, `template`, `system`) in addition to any
+  configured context-length capping. This removes local paths, embedded prompts,
+  and license text that can help fingerprint the model; `admin` requests are not
+  sanitized.
 
 ### Custom root message
 
@@ -149,12 +151,20 @@ Validation includes:
 - blocked file extensions (for example `.php`, `.env`, `.git`)
 - blocked path prefixes (for example `/wp-admin`, `/admin`, `/cgi-bin`)
 - a strict `max_path_length` (default `100`)
-- a strict allowed-path policy (`/`, the status page path, `/api/`, `/v1/`)
+- a strict allowed-path policy (`/`, the status page path, `/favicon.ico`, `/api/`, `/v1/`)
 
 Recent rejected probe paths are retained in request history for
 `probe_collapse_after_seconds` (default 10 minutes), then collapsed into a
 single placeholder line so scans do not dominate request history or per-path
 counts.
+
+### Favicon
+
+Browsers automatically request `/favicon.ico` for any HTML page. The proxy
+answers `GET /favicon.ico` locally with `204 No Content` (there is no icon),
+so that check is never counted as a probe and never reaches Ollama. The status
+page also declares this with `<link rel="icon" href="data:,">`, which keeps
+browsers from requesting `/favicon.ico` in the first place.
 
 ## Run it
 
@@ -198,6 +208,22 @@ OLLAMA_FRONT_CONFIG=/path/to/config.json python3 proxy.py
 
 Resolution order: `--config`, then `OLLAMA_FRONT_CONFIG`, then `config.json`
 next to `proxy.py`.
+
+#### Minimizing config.json
+
+`config.json` keys that equal their defaults can be omitted. Defaults are
+centralized in `proxy.py` (`_CONFIG_DEFAULTS`), so config loading and
+minimization share one source of truth. The proxy includes a helper that strips
+those keys and keeps required/non-default values:
+
+```sh
+python3 proxy.py --minimize-config          # print minimized config.json
+python3 proxy.py --minimize-config path.json # rewrite path.json in place
+```
+
+Required keys (no default) are always preserved: `upstream_host`,
+`upstream_port`, `listen_host`, `listen_port`, `forced_model`, and
+`rate_limit_per_minute`.
 
 ## API keys
 

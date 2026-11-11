@@ -58,6 +58,7 @@ API_KEYS_JSON="${SCRIPT_DIR}/api_keys.json"
 
 DRY_RUN=0
 NO_ENABLE=0
+MINIMIZE_CONFIG=0
 REQUESTED_SCOPE=""  # "" | "system" | "user"
 ACTION="install"    # install | uninstall | status | restart
 
@@ -89,6 +90,7 @@ Options:
   --user        Per-user service, no sudo (systemd user unit / launchd agent).
   --dry-run,-n  Print the unit/plist and commands, but change nothing.
   --no-enable   Write the unit/plist but do not enable/start it.
+  --minimize-config  Strip config.json keys equal to their defaults (required/non-default keys kept).
   --restart     Restart the service.
   --uninstall   Disable and remove the service.
   --status      Show whether the service is running (plus recent logs).
@@ -106,6 +108,7 @@ parse_args() {
       --user)   REQUESTED_SCOPE="user" ;;
       --dry-run|-n) DRY_RUN=1 ;;
       --no-enable) NO_ENABLE=1 ;;
+      --minimize-config) MINIMIZE_CONFIG=1 ;;
       --restart|restart) ACTION="restart" ;;
       --uninstall|uninstall) ACTION="uninstall" ;;
       --status|status) ACTION="status" ;;
@@ -143,6 +146,14 @@ ensure_config() {
     warn "api_keys.json not found — proxy will run with no API keys"
     warn "  (anonymous tier only). Copy api_keys.json.example to api_keys.json"
     warn "  if you want admin/unlimited/standard keys."
+  fi
+  if [[ "$MINIMIZE_CONFIG" -eq 1 ]]; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      say "[dry-run] would minimize $CONFIG_JSON (strip keys equal to defaults)"
+    else
+      say "Minimizing config.json (strip keys equal to defaults)"
+      run python3 "$PROXY_PY" --minimize-config "$CONFIG_JSON"
+    fi
   fi
 }
 

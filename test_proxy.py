@@ -162,7 +162,7 @@ def check_dedup():
     src = open(os.path.join(BASE, "proxy.py")).read()
     for name in ("_enter_gate", "_serve_root", "_handle", "_log", "_is_client_alive",
                  "_serve_stub_tags", "_serve_stub_v1_models", "_serve_stub_v1_model",
-                 "_respond", "_serve_status", "_drop_probe", "log_message"):
+                 "_respond", "_serve_status", "_serve_favicon", "_drop_probe", "log_message"):
         cnt = len(re.findall(rf"def {re.escape(name)}\s*\(", src))
         check(f"§1 dedup: exactly one def {name}", cnt == 1, f"found {cnt}")
     top = src.split("\n\n", 3)[0] if "\n\n" in src else src[:2000]
@@ -209,12 +209,19 @@ def check_dedup():
           re.search(r'CONFIG\.get\(\s*"status_path"', src) is not None
           and re.search(r"STATUS_PATH\s*=", src) is not None)
     check("§1 status path defaults to /proxy-status",
-          '"/proxy-status"' in src and 'CONFIG.get("status_path", "/proxy-status")' in src)
+          '"/proxy-status"' in src and '_CONFIG_DEFAULTS["status_path"]' in src
+          and 'CONFIG.get("status_path", _CONFIG_DEFAULTS["status_path"])' in src)
     check("§1 no hardcoded /status route (STATUS_PATH only)",
           '"/status"' not in src and "STATUS_PATH" in src)
     check("§1 probe helpers (is_obviously_a_probe/is_valid_ollama/is_probe)",
           all(n in src for n in ("def is_obviously_a_probe",
                                  "def is_valid_ollama", "def is_probe")))
+    valid_body = re.search(r"def is_valid_ollama.*?(?=\ndef )", src, re.S)
+    valid_body = valid_body.group(0) if valid_body else ""
+    check("§1 favicon paths valid, not probes (FAVICON_PATHS in is_valid_ollama)",
+          "FAVICON_PATHS" in valid_body and "def _serve_favicon" in src)
+    check("§1 status page declares no favicon (icon link)",
+          'rel="icon" href="data:,"' in src)
     check("§1 probe constants (BLOCKED_EXTENSIONS/BLOCKED_PATHS/MAX_PATH_LENGTH)",
           all(n in src for n in ("BLOCKED_EXTENSIONS", "BLOCKED_PATHS",
                                  "MAX_PATH_LENGTH")))
@@ -314,6 +321,29 @@ def check_reported_context_rewrite():
         proxy.REPORTED_CONTEXT_LENGTH = old_cap
 
 
+def check_favicon():
+    """Unit checks: /favicon.ico is a local path, never a probe."""
+    old_cwd = os.getcwd()
+    os.chdir(BASE)
+    try:
+        if BASE not in sys.path:
+            sys.path.insert(0, BASE)
+        import proxy
+    except Exception as e:
+        check("§1d import proxy for favicon tests", False, repr(e))
+        os.chdir(old_cwd)
+        return
+    finally:
+        os.chdir(old_cwd)
+
+    check("§1d /favicon.ico is not a probe", proxy.is_probe("/favicon.ico") is False)
+    check("§1d /favicon.ico is a valid local path",
+          proxy.is_valid_ollama("/favicon.ico") is True)
+    check("§1d FAVICON_PATHS constant present",
+          bool(getattr(proxy, "FAVICON_PATHS", None)))
+    check("§1d known probe path still a probe", proxy.is_probe("/wp-admin") is True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-stream", action="store_true", help="skip slow streaming disconnect test")
@@ -323,6 +353,7 @@ def main():
     print("=== §1 de-duplication ===")
     check_dedup()
     check_reported_context_rewrite()
+    check_favicon()
 
     config = json.load(open(os.path.join(BASE, "config.json")))
     forced = config["forced_model"]
@@ -524,6 +555,22 @@ def main():
         check(f"§5 {status_path} history shows actual probe path (.php)",
               st == 200 and b"/index.php" in body,
               f"status={st}")
+        print("=== §5 favicon (served locally, not a probe) ===")
+        st, _, _ = http_get(f"{base}/favicon.ico")
+        check("§5 /favicon.ico served locally (204)", st == 204, f"got {st}")
+        # A favicon check must not inflate the probe counter.
+        st, _, body = http_get(f"{base}{status_path}", headers=hdr_admin)
+        m = re.search(r"<b>(\d+)</b><span>probes dropped", body.decode(errors="replace"))
+        probes_before = int(m.group(1)) if m else -1
+        st, _, _ = http_get(f"{base}/favicon.ico")
+        st, _, body = http_get(f"{base}{status_path}", headers=hdr_admin)
+        m = re.search(r"<b>(\d+)</b><span>probes dropped", body.decode(errors="replace"))
+        probes_after = int(m.group(1)) if m else -1
+        check("§5 /favicon.ico does not increment probes dropped",
+              probes_before == probes_after,
+              f"before={probes_before} after={probes_after}")
+        check(f"§5 {status_path} declares no favicon (icon link)",
+              st == 200 and b'rel="icon" href="data:,"' in body, f"status={st}")
         # Legitimate paths still work after probes (no rate-limit burn).
         # Use admin (exempt) so this doesn't consume the §4 global bucket,
         # or the anon /api/tags stub which bypasses the limiter entirely.
