@@ -52,7 +52,6 @@ other local models and avoids an upstream roundtrip for common discovery calls.
 
 Admins receive the real upstream model lists.
 
-
 ### Concurrency and queueing
 
 Ollama requests that can consume inference resources are serialized through a
@@ -66,10 +65,12 @@ When the queue is full or a request times out waiting, the proxy returns `503`.
 **All tiers queue**, including `admin` and `unlimited`; API keys do not bypass
 the queue.
 
-Lightweight requests skip the gate entirely, regardless of tier: `GET /`,
-`/api/version`, `/api/ps`, `/api/tags`, `/v1/models`, and `POST /api/show`
-(these endpoints never run inference). Telemetry-restricted responses such as the
-fixed `/api/version` and non-admin `/api/ps` stub are still served locally.
+Lightweight requests that never run inference skip the concurrency gate for all tiers:
+
+- `GET /`, `GET /api/version`, `GET /api/ps`, `GET /api/tags`, `GET /v1/models`
+- `POST /api/show` (reads model metadata only)
+
+Some of these are still handled or rewritten locally for telemetry/control (for example, `GET /` returns `root_response`, `GET /api/version` is a fixed response, and non-admin `GET /api/ps` is stubbed), but none consume an Ollama inference slot. All other inference-capable requests are subject to queueing.
 
 ### Rate limiting
 
@@ -90,7 +91,6 @@ header. Requests without a key are treated as `standard`.
 | `unlimited` | Yes | Yes | No | Yes |
 | `standard` | No | Yes | No | Yes |
 | no key | No | Yes | No | Yes |
-
 
 ## Status page
 
@@ -135,6 +135,11 @@ To reduce fingerprinting and information disclosure:
 - For non-admin responses, Ollama timing fields (`total_duration`,
   `load_duration`, `prompt_eval_duration`, `eval_duration`) are rounded up to
   the nearest 10 seconds to reduce precise performance fingerprinting.
+
+### Parameter lockdown
+
+In addition to measures above in the Forced Model section, applies the following:
+
 - For non-admin requests, `options` are restricted to `num_ctx`, `temperature`,
   `top_p`, `top_k`, `seed`, `stop`, and `num_predict`; other hardware/memory
   tuning flags are dropped.
