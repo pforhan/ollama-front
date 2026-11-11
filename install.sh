@@ -14,6 +14,7 @@
 #   ./install.sh --user              systemd user unit / launchd agent (no sudo)
 #   ./install.sh --system            explicit system-wide install (default on Linux)
 #   ./install.sh --no-enable         write unit/plist but don't enable/start
+#   ./install.sh --restart           restart the service
 #   ./install.sh --status            show service status (and recent logs)
 #   ./install.sh --uninstall         disable/remove the service
 #   ./install.sh --help
@@ -58,7 +59,7 @@ API_KEYS_JSON="${SCRIPT_DIR}/api_keys.json"
 DRY_RUN=0
 NO_ENABLE=0
 REQUESTED_SCOPE=""  # "" | "system" | "user"
-ACTION="install"    # install | uninstall | status
+ACTION="install"    # install | uninstall | status | restart
 
 # --- small helpers ----------------------------------------------------------
 
@@ -79,7 +80,7 @@ run() {
 usage() {
   cat <<'EOF'
 Usage: ./install.sh [--system|--user] [--dry-run] [--no-enable]
-                    [--uninstall|--status]
+                    [--restart|--uninstall|--status]
 
 Install ollama-front as a background service.
 
@@ -88,6 +89,7 @@ Options:
   --user        Per-user service, no sudo (systemd user unit / launchd agent).
   --dry-run,-n  Print the unit/plist and commands, but change nothing.
   --no-enable   Write the unit/plist but do not enable/start it.
+  --restart     Restart the service.
   --uninstall   Disable and remove the service.
   --status      Show whether the service is running (plus recent logs).
   --help,-h     Show this help.
@@ -104,6 +106,7 @@ parse_args() {
       --user)   REQUESTED_SCOPE="user" ;;
       --dry-run|-n) DRY_RUN=1 ;;
       --no-enable) NO_ENABLE=1 ;;
+      --restart|restart) ACTION="restart" ;;
       --uninstall|uninstall) ACTION="uninstall" ;;
       --status|status) ACTION="status" ;;
       --help|-h) usage; exit 0 ;;
@@ -358,6 +361,23 @@ status_systemd() {
   fi
 }
 
+restart_systemd() {
+  local scope="$1"
+  if [[ "$scope" == "user" ]]; then
+    say "Restarting systemd user unit: ${SYSTEMD_UNIT}"
+    run systemctl --user restart "$SYSTEMD_UNIT"
+  else
+    local sudo_cmd
+    sudo_cmd="$(systemd_sudo)"
+    say "Restarting systemd system unit: ${SYSTEMD_UNIT}"
+    if [[ -n "$sudo_cmd" ]]; then
+      run sudo systemctl restart "$SYSTEMD_UNIT"
+    else
+      run systemctl restart "$SYSTEMD_UNIT"
+    fi
+  fi
+}
+
 # --- macOS / launchd ----------------------------------------------------------
 
 render_launchd_plist() {
@@ -502,6 +522,18 @@ status_launchd() {
   fi
 }
 
+restart_launchd() {
+  local scope="$1" uid
+  uid="$(id -u)"
+  say "Restarting launchd ${scope} service: ${LAUNCHD_LABEL}"
+  if [[ "$scope" == "system" ]]; then
+    have_cmd sudo || die "--system on macOS needs sudo."
+    run sudo launchctl kickstart -k "system/${LAUNCHD_LABEL}"
+  else
+    run launchctl kickstart -k "gui/${uid}/${LAUNCHD_LABEL}"
+  fi
+}
+
 # --- unsupported platforms ----------------------------------------------------
 
 # TODO(expand): Supported init systems live in detect_os() + the dispatch at
@@ -524,8 +556,8 @@ install_unsupported() {
 main() {
   parse_args "$@"
 
-  # Status/uninstall skip the config preflight so they work even if the
-  # checkout was moved or config.json was deleted.
+  # Status/uninstall/restart skip the config preflight so they work even if
+  # the checkout was moved or config.json was deleted.
   local detected
   detected="$(detect_os)"
   say "Detected platform: ${detected} (script dir: ${SCRIPT_DIR})"
@@ -553,6 +585,15 @@ main() {
           ;;
         uninstall) uninstall_systemd "$scope" ;;
         status)    status_systemd "$scope" ;;
+        restart)
+          restart_systemd "$scope"
+          if [[ "$DRY_RUN" -eq 1 ]]; then
+            say "[dry-run] no service restarted, nothing verified."
+          else
+            verify_listening
+            say "Check logs: journalctl -u ${SYSTEMD_UNIT} -f"
+          fi
+          ;;
       esac
       ;;
     darwin)
@@ -573,6 +614,15 @@ main() {
           ;;
         uninstall) uninstall_launchd "$scope" ;;
         status)    status_launchd "$scope" ;;
+        restart)
+          restart_launchd "$scope"
+          if [[ "$DRY_RUN" -eq 1 ]]; then
+            say "[dry-run] no service restarted, nothing verified."
+          else
+            verify_listening
+            say "Check logs: tail -f ~/Library/Logs/ollama-front.log"
+          fi
+          ;;
       esac
       ;;
     unsupported:*)
