@@ -70,9 +70,18 @@ def http_post(url, data, headers=None, timeout=10):
         return None, {}, f"{type(e).__name__}: {e}".encode()
 
 
-def status_counts(base, status_path="/proxy-status"):
+def _status_auth_headers(admin_key):
+    """Basic auth for status page (user 'admin', password = any admin key)."""
+    if not admin_key:
+        return {}
+    import base64 as _b64
+    token = _b64.b64encode(f"admin:{admin_key}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
+def status_counts(base, status_path="/proxy-status", headers=None):
     """Parse status-page HTML → (running_now, queued_now); -1 if not found."""
-    _st, _, body = http_get(f"{base}{status_path}", timeout=5)
+    _st, _, body = http_get(f"{base}{status_path}", headers=headers or {}, timeout=5)
     txt = body.decode(errors="replace")
     m_run = re.search(r"<b>(\d+)</b><span>running now", txt)
     m_q = re.search(r"<b>(\d+)</b><span>queued now", txt)
@@ -224,12 +233,13 @@ def check_dedup():
           and "old_probe" in src and "_PROBE_PLACEHOLDER" in src)
     check("§1 model context rewrite helper (_rewrite_model_context)",
           "def _rewrite_model_context" in src)
-    rewrite_gate = re.search(r"REPORTED_CONTEXT_LENGTH and tier != \"admin\" and \((.*?)\):",
+    rewrite_gate = re.search(r"tier != \"admin\" and \((.*?)\):",
                              src, re.S)
     rewrite_gate = rewrite_gate.group(1) if rewrite_gate else ""
     check("§1 proxied model stats rewrite covers show/tags/v1/models",
           all(p in rewrite_gate for p in ('/api/show', '/api/tags', '/v1/models', '/v1/models/'))
-          and "_rewrite_model_context(payload)" in src)
+          and "_rewrite_model_context(payload)" in src
+          and "_sanitize_model_info(payload)" in src)
     check("§1 stubs rewrite model context when configured",
           "_serve_stub_tags" in src and "_serve_stub_v1_models" in src
           and src.count("_rewrite_model_context(entry)") >= 3)
@@ -399,7 +409,7 @@ def main():
               b"Ollama is running" not in body)
 
         # Status page sanity
-        st, _, body = http_get(f"{base}{status_path}")
+        st, _, body = http_get(f"{base}{status_path}", headers=hdr_admin)
         check(f"§4 {status_path} 200 HTML", st == 200 and b"ollama-front status" in body,
               f"status={st} len={len(body)}")
         status_before = body.decode(errors="replace")
@@ -501,7 +511,7 @@ def main():
             st, _, _ = http_get(f"{base}{_probe}")
             check(f"§5 probe {_probe[:30]} dropped (no reply)",
                   st is None, f"got status={st}")
-        st, _, body = http_get(f"{base}{status_path}")
+        st, _, body = http_get(f"{base}{status_path}", headers=hdr_admin)
         check(f"§5 {status_path} shows probes dropped (444)",
               st == 200 and b"probes dropped" in body,
               f"status={st}")
@@ -569,7 +579,7 @@ def main():
             except OSError:
                 pass
             time.sleep(1.0)
-            st, _, status_html = http_get(f"{base}{status_path}")
+            st, _, status_html = http_get(f"{base}{status_path}", headers=hdr_admin)
             m = re.search(r"<b>(\d+)</b><span>running now", status_html.decode(errors="replace"))
             running_while = int(m.group(1)) if m else -1
             check("§2 slot held while stream open (running now ≥ 1)",
@@ -586,7 +596,7 @@ def main():
             # the next completed read — allow up to ~20s for the slot to free.
             for _ in range(80):
                 time.sleep(0.25)
-                st, _, html_ = http_get(f"{base}{status_path}")
+                st, _, html_ = http_get(f"{base}{status_path}", headers=hdr_admin)
                 m = re.search(r"<b>(\d+)</b><span>running now", html_.decode(errors="replace"))
                 if m and int(m.group(1)) == 0:
                     freed_within = True
@@ -635,7 +645,7 @@ def main():
                     blocker_sock = send_generate_sock(port2, blocker_payload, admin_key)
                     read_http_headers(blocker_sock)
                     time.sleep(1.0)
-                    running, queued = status_counts(base2, status_path)
+                    running, queued = status_counts(base2, status_path, headers=_status_auth_headers(admin_key))
                     check("§2q slot held by blocker (running=1)", running == 1,
                           f"running={running} queued={queued}")
                     # Survivor: stays connected, queued behind blocker, then runs.
@@ -667,7 +677,7 @@ def main():
                     survivor_thread.start()
                     queued_seen = -1
                     for _ in range(12):
-                        running, queued = status_counts(base2, status_path)
+                        running, queued = status_counts(base2, status_path, headers=_status_auth_headers(admin_key))
                         queued_seen = queued
                         if queued >= 1:
                             break
@@ -680,7 +690,7 @@ def main():
                     victim_sock = send_generate_sock(port2, victim_payload, admin_key)
                     queued_seen = -1
                     for _ in range(12):
-                        running, queued = status_counts(base2, status_path)
+                        running, queued = status_counts(base2, status_path, headers=_status_auth_headers(admin_key))
                         queued_seen = queued
                         if queued >= 2:
                             break
@@ -691,7 +701,7 @@ def main():
                     hard_close(victim_sock)
                     queued_after = -1
                     for _ in range(20):
-                        running, queued = status_counts(base2, status_path)
+                        running, queued = status_counts(base2, status_path, headers=_status_auth_headers(admin_key))
                         queued_after = queued
                         if queued == 1:
                             break
@@ -716,7 +726,7 @@ def main():
                           log2[-500:] if "queued-disconnected" not in log2 else "")
                     # Counts should settle back to idle.
                     for _ in range(20):
-                        running, queued = status_counts(base2, status_path)
+                        running, queued = status_counts(base2, status_path, headers=_status_auth_headers(admin_key))
                         if running == 0 and queued == 0:
                             break
                         time.sleep(0.25)

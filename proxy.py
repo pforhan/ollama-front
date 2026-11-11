@@ -11,6 +11,7 @@ serve/funnel), otherwise the raw peer IP — so a directly-exposed proxy
 can't be spoofed via those headers."""
 
 import argparse
+import base64
 import json
 import os
 import sys
@@ -444,6 +445,12 @@ _NUM_CTX_BODY_PATHS = {
     "/v1/chat/completions", "/v1/completions", "/v1/embeddings",
 }
 
+# Fixed /api/version payload to avoid leaking the real Ollama/server version.
+FIXED_VERSION = {"version": "0.0.0"}
+
+# Fields in model metadata that can leak build details, prompts, or local paths.
+_SENSITIVE_MODEL_FIELDS = ("license", "modelfile", "template", "system")
+
 
 def _cap_num_ctx(payload):
     """Cap options.num_ctx in-place when REPORTED_CONTEXT_LENGTH is set."""
@@ -491,6 +498,28 @@ def _rewrite_model_context(payload):
                 lambda m: m.group(1) + str(min(int(m.group(2)), cap)),
                 text)
 
+
+def _sanitize_model_info(payload):
+    """Strip sensitive model metadata (paths, prompts, license text) in-place.
+
+    Applied to /api/show (and defensively to model-list wrappers) for non-admins
+    to reduce telemetry/fingerprinting. Does not alter model identity fields.
+    """
+    if not isinstance(payload, (dict, list)):
+        return
+    if isinstance(payload, list):
+        for item in payload:
+            _sanitize_model_info(item)
+        return
+    # Wrappers used by /api/tags and /v1/models.
+    for key in ("models", "data"):
+        items = payload.get(key)
+        if isinstance(items, list):
+            for item in items:
+                _sanitize_model_info(item)
+    for field in _SENSITIVE_MODEL_FIELDS:
+        payload.pop(field, None)
+
 _keys_lock = threading.Lock()
 _keys_cache = {"mtime": 0, "data": {}}
 
@@ -520,7 +549,8 @@ def load_keys():
 def get_tier(headers):
     key = None
     auth = headers.get("Authorization", "")
-    if auth.lower().startswith("bearer "):
+    auth_lower = auth.lower()
+    if auth_lower.startswith("bearer "):
         key = auth[7:].strip()
     if not key:
         key = headers.get("X-API-Key", "").strip()
@@ -530,6 +560,27 @@ def get_tier(headers):
     if tier is None:
         return key, "invalid"
     return key, tier
+
+
+def _is_admin_status_auth(headers):
+    """Status page auth: admin Bearer/X-API-Key, or Basic user 'admin' + admin key."""
+    _key, tier = get_tier(headers)
+    if tier == "admin":
+        return True
+    auth = headers.get("Authorization", "")
+    if not auth.lower().startswith("basic "):
+        return False
+    token = auth.split(" ", 1)[1].strip() if " " in auth else ""
+    try:
+        decoded = base64.b64decode(token).decode("utf-8")
+    except Exception:
+        return False
+    if ":" not in decoded:
+        return False
+    user, password = decoded.split(":", 1)
+    if user != "admin":
+        return False
+    return load_keys().get(password) == "admin"
 
 
 # --- global sliding-window rate limiter ---
@@ -838,6 +889,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._status = 200
         self._respond(200, entry)
 
+    def _serve_fixed_version(self):
+        self._status = 200
+        self._respond(200, FIXED_VERSION)
+
+    def _serve_stub_ps(self):
+        # Non-admins get no visibility into which models are loaded/running.
+        self._status = 200
+        self._respond(200, {"models": []})
+
     def _serve_root(self):
         self._status = 200
         try:
@@ -981,34 +1041,49 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._serve_root()
             _record("/", "anonymous", 200, 0.0)
             return
-        start = time.monotonic()
-        # Status page is handled locally (not proxied) so it works even when Ollama is down.
+        # Status page is handled locally (admin-only). Supports browser Basic auth
+        # (user "admin", password = any admin API key) and admin Bearer/X-API-Key.
         if self.path.split("?", 1)[0] == STATUS_PATH and self.command == "GET":
+            if not _is_admin_status_auth(self.headers):
+                self._status = 401
+                body = b'{"error":"authentication required"}'
+                try:
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("WWW-Authenticate", 'Basic realm="ollama-front status"')
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    self._client_gone = True
+                _record(STATUS_PATH, "anonymous", 401, 0.0)
+                return
             self._serve_status()
             return
         # Stub /api/tags locally: non-admins only ever see the forced model.
         # Answers instantly, never hits Ollama, never queues. Admins see the real list.
-        if self.path.split("?", 1)[0] == "/api/tags" and STUB_TAGS:
+        # Served before auth/rate-limit (legacy behavior): stubs never consume quota.
+        if path == "/api/tags" and STUB_TAGS:
             key0, tier0 = get_tier(self.headers)
             if tier0 != "admin":
                 self._serve_stub_tags()
                 _record("/api/tags", tier0, 200, 0.0)
                 return
         # Stub /v1/models and /v1/models/:id locally (same idea as tags).
-        # Non-admins only ever see the forced model, even when they ask for
-        # another id (like /api/show forcing). Admins see the real list.
-        if STUB_TAGS:
-            _p = self.path.split("?", 1)[0]
-            if _p == "/v1/models" or _p.startswith("/v1/models/"):
-                key0, tier0 = get_tier(self.headers)
-                if tier0 != "admin":
-                    if _p == "/v1/models":
-                        self._serve_stub_v1_models()
-                    else:
-                        self._serve_stub_v1_model()
-                    _record(_p, tier0, 200, 0.0)
-                    return
+        if STUB_TAGS and (path == "/v1/models" or path.startswith("/v1/models/")):
+            key0, tier0 = get_tier(self.headers)
+            if tier0 != "admin":
+                if path == "/v1/models":
+                    self._serve_stub_v1_models()
+                else:
+                    self._serve_stub_v1_model()
+                _record(path, tier0, 200, 0.0)
+                return
         key, tier = get_tier(self.headers)
+
+        path = self.path.split("?", 1)[0]
 
         if tier == "invalid":
             self._status = 401
@@ -1018,7 +1093,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Block mutations/downloads for non-admins (pull/create/copy/delete/
         # push/blobs) — they carry arbitrary model names/digests and forcing
         # would be unsafe (e.g. /api/create would overwrite the forced model).
-        path = self.path.split("?", 1)[0]
         if _is_blocked_path(path) and tier != "admin":
             self._status = 403
             self._respond(403, {"error": f"{path} is disabled"})
@@ -1031,6 +1105,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._status = 429
                 self._respond(429, {"error": f"rate limit exceeded ({RATE_LIMIT}/min)"})
                 return
+
+        # Telemetry lockdown: fixed version for all, and hide running-model
+        # state (/api/ps) from non-admins. Handled locally, never upstream.
+        # Placed after auth/block/rate-limit so invalid keys still 401 and
+        # lightweight probes/stubs still consume the global anon/standard quota.
+        if path == "/api/version" and self.command == "GET":
+            self._serve_fixed_version()
+            _record(path, tier, 200, 0.0)
+            return
+        if path == "/api/ps" and self.command == "GET" and tier != "admin":
+            self._serve_stub_ps()
+            _record(path, tier, 200, 0.0)
+            return
 
         body = _read_request_body(self)
         self._body_consumed = True
@@ -1118,7 +1205,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         except (http.client.HTTPException, OSError):
                             raw = b""
                         out = raw
-                        if REPORTED_CONTEXT_LENGTH and tier != "admin" and (
+                        if tier != "admin" and (
                             path == "/api/show" or path == "/api/tags" or
                             path == "/v1/models" or path.startswith("/v1/models/")
                         ):
@@ -1126,7 +1213,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             if "json" in ctype or not ctype or raw[:1] in (b"{", b"["):
                                 try:
                                     payload = json.loads(raw)
-                                    _rewrite_model_context(payload)
+                                    if REPORTED_CONTEXT_LENGTH:
+                                        _rewrite_model_context(payload)
+                                    # Strip modelfile/license/template/system to limit telemetry.
+                                    _sanitize_model_info(payload)
                                     out = json.dumps(payload).encode()
                                 except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                                     out = raw

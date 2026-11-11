@@ -52,6 +52,21 @@ other local models and avoids an upstream roundtrip for common discovery calls.
 
 Admins receive the real upstream model lists.
 
+### Telemetry lockdown
+
+To reduce fingerprinting and information disclosure:
+
+- `GET /api/version` returns a fixed response (`{"version":"0.0.0"}`) instead of
+  proxying the real upstream version.
+- `GET /api/ps` returns `{"models":[]}` for non-admin callers so running/loaded
+  model state is not exposed; `admin` API keys receive the real upstream
+  response.
+- `POST /api/show` responses for non-admin callers have sensitive metadata
+  stripped (`modelfile`, `license`, `template`, `system`) in addition to any
+  configured context-length capping. This removes local paths, embedded prompts,
+  and license text that can help fingerprint the model; `admin` requests are not
+  sanitized.
+
 ### Concurrency and queueing
 
 Ollama requests that can consume inference resources are serialized through a
@@ -66,7 +81,9 @@ When the queue is full or a request times out waiting, the proxy returns `503`.
 the queue.
 
 Lightweight requests skip the gate entirely, regardless of tier: `GET /`,
-`/api/version`, `/api/ps`, `/api/tags`, `/v1/models`, and `POST /api/show`.
+`/api/version`, `/api/ps`, `/api/tags`, `/v1/models`, and `POST /api/show`
+(these endpoints never run inference). Telemetry-restricted responses such as the
+fixed `/api/version` and non-admin `/api/ps` stub are still served locally.
 
 ### Rate limiting
 
@@ -100,6 +117,12 @@ including:
 
 For active and queued requests it shows method, path, tier, client,
 elapsed/waiting time, and queue position.
+
+The status page is **admin-only**. Browsers can authenticate via HTTP Basic auth
+(username `admin`, password = any `admin` API key from `api_keys.json`), which
+triggers the browser's native login prompt. Non-browser clients may also use an
+admin `Authorization: Bearer <key>` or `X-API-Key` header. Unauthenticated
+requests receive `401` with a `WWW-Authenticate: Basic` challenge.
 
 When running behind `tailscale serve`/`funnel`, the proxy reports the real
 source IP (or Tailscale login) instead of loopback. It trusts forwarded
