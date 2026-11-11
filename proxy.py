@@ -303,9 +303,18 @@ def _is_blocked_path(path):
     return False
 
 
-def _read_chunked_body(rfile, limit=None):
-    """Decode an HTTP/1.1 chunked request body. Returns bytes or None on error.
+def _max_json_body_bytes():
+    """Max request body size for JSON endpoints, related to reported/context length."""
+    if REPORTED_CONTEXT_LENGTH:
+        # Rough budget: bytes per token * context, with floor for overhead/messages.
+        return max(256 * 1024, REPORTED_CONTEXT_LENGTH * 16)
+    return 1024 * 1024
 
+
+def _read_chunked_body(rfile, limit=None):
+    """Decode an HTTP/1.1 chunked request body.
+
+    Returns (body_bytes_or_None, too_large_bool). On parse/IO errors returns (None, False).
     BaseHTTPRequestHandler does not decode Transfer-Encoding: chunked, so
     clients that send chunked request bodies (common with some JVM HTTP
     libraries) would otherwise be forwarded with an empty/missing body."""
@@ -314,13 +323,13 @@ def _read_chunked_body(rfile, limit=None):
     while True:
         line = rfile.readline()
         if not line:
-            return None
+            return None, False
         # strip chunk extensions (";ext=...") and CRLF
         size_str = line.split(b";", 1)[0].strip()
         try:
             size = int(size_str, 16)
         except ValueError:
-            return None
+            return None, False
         if size == 0:
             # consume trailer headers + terminating CRLF
             while True:
@@ -329,19 +338,23 @@ def _read_chunked_body(rfile, limit=None):
                     break
             break
         if limit is not None and total + size > limit:
-            return None
+            return None, True
         data = rfile.read(size)
         if len(data) != size:
-            return None
+            return None, False
         chunks.append(data)
         total += size
         # consume CRLF after chunk data
         rfile.readline()
-    return b"".join(chunks)
+    return b"".join(chunks), False
 
 
-def _read_request_body(handler, limit=100 * 1024 * 1024):
-    """Read request body, handling Content-Length and chunked encoding."""
+def _read_request_body(handler, limit=None):
+    """Read request body, handling Content-Length and chunked encoding.
+
+    Returns (body_bytes_or_None, too_large_bool)."""
+    if limit is None:
+        limit = _max_json_body_bytes()
     te = (handler.headers.get("Transfer-Encoding") or "").lower()
     if "chunked" in te:
         return _read_chunked_body(handler.rfile, limit=limit)
@@ -350,10 +363,10 @@ def _read_request_body(handler, limit=100 * 1024 * 1024):
     except ValueError:
         length = 0
     if length <= 0:
-        return None
-    if length > limit:
-        return None
-    return handler.rfile.read(length)
+        return None, False
+    if limit is not None and length > limit:
+        return None, True
+    return handler.rfile.read(length), False
 
 
 # --- probe mitigation helpers ---
@@ -1266,8 +1279,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             _record(path, tier, 200, 0.0)
             return
 
-        body = _read_request_body(self)
+        body, body_too_large = _read_request_body(self)
         self._body_consumed = True
+        if body_too_large:
+            self._status = 413
+            self._respond(413, {"error": "request body too large"})
+            _record(path, tier, 413, 0.0)
+            return
 
         # Concurrency gate: hold a slot for the whole upstream exchange.
         # Universal — every tier (admin/unlimited/standard/anonymous) queues here;
@@ -1491,7 +1509,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if not getattr(self, "_body_consumed", False):
             try:
                 _read_request_body(self)
-            except (ValueError, OSError):
+            except (ValueError, OSError, TypeError):
                 pass
         data = json.dumps(obj).encode()
         try:

@@ -146,6 +146,9 @@ In addition to measures above in the Forced Model section, applies the following
 - For non-admin requests, client-supplied `keep_alive` is ignored and replaced
   with the configured constant (`keep_alive`, default `5m`). Admin requests are
   forwarded unchanged.
+- Oversized request bodies are rejected with `413` before JSON parsing to reduce
+  memory pressure. The maximum body size is derived from `reported_context_length`
+  (or a small default when unset).
 
 ### Custom root message
 

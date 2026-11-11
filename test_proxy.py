@@ -344,6 +344,60 @@ def check_favicon():
     check("§1d known probe path still a probe", proxy.is_probe("/wp-admin") is True)
 
 
+def check_max_json_body():
+    """Unit checks: request body size limit and oversize rejection helpers."""
+    old_cwd = os.getcwd()
+    os.chdir(BASE)
+    try:
+        if BASE not in sys.path:
+            sys.path.insert(0, BASE)
+        import io
+        import proxy
+    except Exception as e:
+        check("§1e import proxy for max-json-body tests", False, repr(e))
+        os.chdir(old_cwd)
+        return
+    finally:
+        os.chdir(old_cwd)
+
+    old_cap = proxy.REPORTED_CONTEXT_LENGTH
+    try:
+        proxy.REPORTED_CONTEXT_LENGTH = 4096
+        limit = proxy._max_json_body_bytes()
+        check("§1e max body derived from reported_context_length",
+              limit == max(256 * 1024, 4096 * 16), f"got {limit}")
+
+        proxy.REPORTED_CONTEXT_LENGTH = 0
+        check("§1e max body default when context unset",
+              proxy._max_json_body_bytes() == 1024 * 1024,
+              f"got {proxy._max_json_body_bytes()}")
+
+        class H:
+            pass
+
+        h = H()
+        h.headers = {"Content-Length": "7"}
+        h.rfile = io.BytesIO(b'{"a":1}')
+        body, too_large = proxy._read_request_body(h, limit=10)
+        check("§1e small Content-Length body accepted",
+              body == b'{"a":1}' and too_large is False, f"body={body!r} too_large={too_large}")
+
+        h.headers = {"Content-Length": "20"}
+        h.rfile = io.BytesIO(b"x" * 20)
+        body, too_large = proxy._read_request_body(h, limit=10)
+        check("§1e oversize Content-Length rejected before read",
+              body is None and too_large is True, f"body={body!r} too_large={too_large}")
+
+        # Chunked body over limit: "b\r\n" + 11 bytes + "\r\n0\r\n\r\n"
+        h.headers = {"Transfer-Encoding": "chunked"}
+        h.rfile = io.BytesIO(b"b\r\n" + b"x" * 11 + b"\r\n0\r\n\r\n")
+        body, too_large = proxy._read_request_body(h, limit=10)
+        check("§1e oversize chunked body rejected",
+              body is None and too_large is True, f"body={body!r} too_large={too_large}")
+    finally:
+        proxy.REPORTED_CONTEXT_LENGTH = old_cap
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-stream", action="store_true", help="skip slow streaming disconnect test")
@@ -354,6 +408,7 @@ def main():
     check_dedup()
     check_reported_context_rewrite()
     check_favicon()
+    check_max_json_body()
 
     config = json.load(open(os.path.join(BASE, "config.json")))
     forced = config["forced_model"]
