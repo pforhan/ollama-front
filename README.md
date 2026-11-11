@@ -167,14 +167,6 @@ Recent rejected probe paths are retained in request history for
 single placeholder line so scans do not dominate request history or per-path
 counts.
 
-### Favicon
-
-Browsers automatically request `/favicon.ico` for any HTML page. The proxy
-answers `GET /favicon.ico` locally with `204 No Content` (there is no icon),
-so that check is never counted as a probe and never reaches Ollama. The status
-page also declares this with `<link rel="icon" href="data:,">`, which keeps
-browsers from requesting `/favicon.ico` in the first place.
-
 ## Run it
 
 ```bash
