@@ -101,6 +101,7 @@ including:
 - requests currently running inside Ollama
 - requests currently queued
 - slot/queue occupancy against `max_concurrent_requests` / `max_queue_size`
+- configured CORS allowed origins and request counts by origin
 
 For active and queued requests it shows method, path, tier, client,
 elapsed/waiting time, and queue position.
@@ -135,6 +136,45 @@ To reduce fingerprinting and information disclosure:
 - For non-admin responses, Ollama timing fields (`total_duration`,
   `load_duration`, `prompt_eval_duration`, `eval_duration`) are rounded up to
   the nearest 10 seconds to reduce precise performance fingerprinting.
+
+### CORS (browser cross-origin access)
+
+When a web app runs in the browser on a different origin than this proxy, the
+proxy can answer CORS preflights and add CORS headers for allowed origins.
+
+Configure allowed origins in `config.json`:
+
+```json
+"cors_allowed_origins": [
+  "https://your-webapp.example.com",
+  "http://localhost:8080"
+]
+```
+
+Behavior:
+
+- **Conditional:** CORS headers are added only when the request includes an
+  `Origin` header that exactly matches an entry in `cors_allowed_origins`.
+  Requests without an `Origin`, or from origins not in the allowlist, do not
+  receive CORS allow headers (and any upstream CORS headers are stripped when
+  CORS is configured, so the browser blocks cross-origin JS access).
+- **Reflected origin:** the proxy echoes back the request's `Origin` value
+  (never a different allowed origin), so a request from
+  `http://localhost:8080` is allowed as `http://localhost:8080` and not as
+  another configured host.
+- **Preflights:** `OPTIONS` requests with `Origin` and
+  `Access-Control-Request-Method` are answered locally for allowed origins with
+  `204 No Content` and the required preflight headers (including echoed
+  `Access-Control-Request-Headers`, `Access-Control-Allow-Methods`, and
+  `Access-Control-Max-Age`), without hitting auth, rate limiting, the queue, or
+  upstream.
+- **Actual responses:** allowed cross-origin responses include
+  `Access-Control-Allow-Origin` (the requesting origin),
+  `Access-Control-Expose-Headers: *`, and `Vary: Origin` on local responses,
+  proxied responses (including streamed responses), and error responses.
+- **Default:** `cors_allowed_origins` defaults to `[]` (disabled), preserving
+  previous behavior. When enabled, upstream `Access-Control-*` headers are
+  normalized/replaced to avoid duplicates or conflicting values.
 
 ### Parameter lockdown
 

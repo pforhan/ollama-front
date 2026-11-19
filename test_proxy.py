@@ -70,6 +70,17 @@ def http_post(url, data, headers=None, timeout=10):
         return None, {}, f"{type(e).__name__}: {e}".encode()
 
 
+def http_request(method, url, headers=None, data=None, timeout=10):
+    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, dict(r.headers), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+    except Exception as e:
+        return None, {}, f"{type(e).__name__}: {e}".encode()
+
+
 def _status_auth_headers(admin_key):
     """Basic auth for status page (user 'admin', password = any admin key)."""
     if not admin_key:
@@ -250,6 +261,24 @@ def check_dedup():
     check("§1 stubs rewrite model context when configured",
           "_serve_stub_tags" in src and "_serve_stub_v1_models" in src
           and src.count("_rewrite_model_context(entry)") >= 3)
+    # §C CORS support (static/source checks)
+    check("§C cors config default in _CONFIG_DEFAULTS",
+          'cors_allowed_origins' in src and '"cors_allowed_origins": []' in src)
+    check("§C cors config parsed (origins/enabled/set)",
+          'CORS_ALLOWED_ORIGINS' in src and 'CORS_ENABLED' in src and '_CORS_ALLOWED_SET' in src)
+    check("§C OPTIONS mapped to handler",
+          'do_OPTIONS' in src)
+    check("§C cors helpers/methods present",
+          all(n in src for n in ('def _apply_cors', 'def _send_upstream_headers', 'def _serve_cors_preflight')))
+    check("§C cors preflight detection/handling",
+          'Access-Control-Request-Method' in src and 'cors-preflight' in src)
+    check("§C cors headers normalized/applied",
+          'Access-Control-Allow-Origin' in src and 'Access-Control-Expose-Headers' in src
+          and 'Access-Control-Max-Age' in src and 'Access-Control-Allow-Headers' in src)
+    check("§C origin stats tracked (by_origin)",
+          '"by_origin": defaultdict(int)' in src and "_stats['by_origin']" in src)
+    check("§C status page shows cors/origin info",
+          'Requests by origin' in src and 'CORS' in src and 'cors_allowed_rows' in src)
     r = subprocess.run([sys.executable, "-m", "py_compile", os.path.join(BASE, "proxy.py")],
                        capture_output=True, text=True)
     check("§1 py_compile", r.returncode == 0, r.stderr.strip()[:300])
@@ -632,6 +661,111 @@ def main():
         st, _, _ = http_get(f"{base}/api/version", headers=hdr_admin)
         check("§5 legitimate /api/version still 200 after probes",
               st == 200, f"got {st}")
+
+        print("=== CORS ===")
+        cors_origins = list(config.get("cors_allowed_origins") or [])
+        if len(cors_origins) >= 2:
+            o1, o2 = cors_origins[0], cors_origins[1]
+        elif len(cors_origins) == 1:
+            o1, o2 = cors_origins[0], "http://localhost:8080"
+        else:
+            o1, o2 = "https://example.com", "http://localhost:8080"
+
+        def hget(hdrs, name):
+            # case-insensitive header lookup
+            if not hdrs:
+                return None
+            for k, v in hdrs.items():
+                if k.lower() == name.lower():
+                    return v
+            return None
+
+        # Preflight: answered locally for allowed origins (no rate-limit/quota).
+        st, hdr, _ = http_request("OPTIONS", f"{base}/api/chat", headers={
+            "Origin": o1,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "Content-Type, Authorization",
+        })
+        check("§C preflight allowed origin -> 204",
+              st == 204, f"got {st}")
+        check("§C preflight reflects requesting origin (not another)",
+              hget(hdr, "Access-Control-Allow-Origin") == o1,
+              f"got {hget(hdr, 'Access-Control-Allow-Origin')!r} expected {o1!r}")
+        check("§C preflight allow methods includes GET/POST/OPTIONS",
+              all(m in (hget(hdr, "Access-Control-Allow-Methods") or "")
+                  for m in ("GET", "POST", "OPTIONS")),
+              hget(hdr, "Access-Control-Allow-Methods"))
+        check("§C preflight echoes requested headers",
+              "authorization" in (hget(hdr, "Access-Control-Allow-Headers") or "").lower()
+              and "content-type" in (hget(hdr, "Access-Control-Allow-Headers") or "").lower(),
+              hget(hdr, "Access-Control-Allow-Headers"))
+        check("§C preflight max-age set",
+              str(hget(hdr, "Access-Control-Max-Age") or "") == "86400",
+              hget(hdr, "Access-Control-Max-Age"))
+        vary_pf = (hget(hdr, "Vary") or "")
+        check("§C preflight vary includes Origin/Request-Method/Request-Headers",
+              "Origin" in vary_pf and "Access-Control-Request-Method" in vary_pf
+              and "Access-Control-Request-Headers" in vary_pf,
+              vary_pf)
+
+        # Multiple allowed origins: reflect exactly what was requested.
+        st, hdr, _ = http_request("OPTIONS", f"{base}/api/chat", headers={
+            "Origin": o2,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "Content-Type",
+        })
+        check("§C preflight reflects second allowed origin",
+              st == 204 and hget(hdr, "Access-Control-Allow-Origin") == o2,
+              f"status={st} origin={hget(hdr, 'Access-Control-Allow-Origin')!r} expected {o2!r}")
+
+        # Disallowed origin: no allow headers.
+        st, hdr, _ = http_request("OPTIONS", f"{base}/api/chat", headers={
+            "Origin": "https://not-allowed.example",
+            "Access-Control-Request-Method": "POST",
+        })
+        check("§C disallowed origin gets no Access-Control-Allow-Origin",
+              hget(hdr, "Access-Control-Allow-Origin") is None,
+              f"status={st} got {hget(hdr, 'Access-Control-Allow-Origin')!r}")
+
+        # Actual responses (local handlers): reflect allowed origin only.
+        st, hdr, body = http_get(f"{base}/", headers={"Origin": o1})
+        check("§C GET / with allowed origin reflected",
+              st == 200 and hget(hdr, "Access-Control-Allow-Origin") == o1
+              and body == expected_root,
+              f"status={st} origin={hget(hdr, 'Access-Control-Allow-Origin')!r}")
+        check("§C GET / exposes headers and varies by Origin",
+              hget(hdr, "Access-Control-Expose-Headers") == "*"
+              and "Origin" in (hget(hdr, "Vary") or ""),
+              f"expose={hget(hdr, 'Access-Control-Expose-Headers')!r} vary={hget(hdr, 'Vary')!r}")
+        st, hdr, _ = http_get(f"{base}/", headers={"Origin": o2})
+        check("§C GET / reflects second allowed origin (not first)",
+              st == 200 and hget(hdr, "Access-Control-Allow-Origin") == o2,
+              f"origin={hget(hdr, 'Access-Control-Allow-Origin')!r} expected {o2!r}")
+        st, hdr, _ = http_get(f"{base}/")
+        check("§C GET / without Origin gets no CORS allow header",
+              st == 200 and hget(hdr, "Access-Control-Allow-Origin") is None,
+              f"origin={hget(hdr, 'Access-Control-Allow-Origin')!r}")
+
+        # Local JSON/auth/error responses include CORS when allowed.
+        # Use admin for /api/version so it doesn't consume the global anon bucket.
+        st, hdr, _ = http_get(f"{base}/api/version", headers={"Origin": o1, **hdr_admin})
+        check("§C /api/version with allowed origin gets CORS headers",
+              st == 200 and hget(hdr, "Access-Control-Allow-Origin") == o1,
+              f"status={st} origin={hget(hdr, 'Access-Control-Allow-Origin')!r}")
+        st, hdr, _ = http_get(f"{base}{status_path}", headers={"Origin": o1})
+        check("§C status 401 with allowed origin gets CORS headers",
+              st == 401 and hget(hdr, "Access-Control-Allow-Origin") == o1,
+              f"status={st} origin={hget(hdr, 'Access-Control-Allow-Origin')!r}")
+
+        # Status page integrates configured hosts and request-origin counts.
+        st, _, body = http_get(f"{base}{status_path}", headers=_status_auth_headers(admin_key))
+        stxt = body.decode(errors="replace")
+        check("§C status page lists configured allowed origins",
+              st == 200 and o1 in stxt and o2 in stxt and "Requests by origin" in stxt,
+              f"status={st} has_o1={o1 in stxt} has_o2={o2 in stxt}")
+        check("§C status page shows request counts for allowed origins",
+              st == 200 and f"<td>{o1}</td>" in stxt and f"<td>{o2}</td>" in stxt,
+              f"status={st}")
 
         print("=== §4 rate limit (global anonymous+standard window) ===")
         # /api/tags for non-admins is served before the rate-limit check in

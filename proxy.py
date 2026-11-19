@@ -46,6 +46,7 @@ _CONFIG_DEFAULTS = {
     "blocked_probe_paths": ["/wp-admin", "/admin", "/cgi-bin", "/phpmyadmin", "/.well-known"],
     "probe_collapse_after_seconds": 600,
     "keep_alive": "5m",
+    "cors_allowed_origins": [],
 }
 
 
@@ -537,6 +538,18 @@ FIXED_VERSION = {"version": "0.0.0"}
 # Keep-alive value supplied to upstream for non-admin requests (client value ignored).
 KEEP_ALIVE = CONFIG.get("keep_alive", _CONFIG_DEFAULTS["keep_alive"])
 
+# CORS: only for requests whose Origin is in this allowlist. The exact request
+# Origin is echoed back (never a different allowed origin), with Vary: Origin.
+_raw_cors = CONFIG.get("cors_allowed_origins", _CONFIG_DEFAULTS["cors_allowed_origins"])
+if isinstance(_raw_cors, list):
+    CORS_ALLOWED_ORIGINS = [o for o in _raw_cors if isinstance(o, str) and o]
+elif isinstance(_raw_cors, str) and _raw_cors:
+    CORS_ALLOWED_ORIGINS = [_raw_cors]
+else:
+    CORS_ALLOWED_ORIGINS = []
+_CORS_ALLOWED_SET = set(CORS_ALLOWED_ORIGINS)
+CORS_ENABLED = bool(_CORS_ALLOWED_SET)
+
 # Request option keys allowed for non-admins (others dropped).
 _ALLOWED_OPTION_KEYS = {"num_ctx", "temperature", "top_p", "top_k", "seed", "stop", "num_predict"}
 
@@ -744,6 +757,7 @@ _stats = {
     "by_status": defaultdict(int),
     "by_tier": defaultdict(int),
     "by_path": defaultdict(int),
+    "by_origin": defaultdict(int),
     "blocked_pulls": 0,
     "rate_limited": 0,
     "invalid_keys": 0,
@@ -854,12 +868,17 @@ def _collapse_old_404s(now=None):
                 _stats["recent"] = deque(kept, maxlen=50)
 
 
-def _record(path, tier, status, duration):
+def _record(path, tier, status, duration, origin=None):
     now = time.time()
     with _stats_lock:
         _stats["total_requests"] += 1
         _stats["by_status"][status] += 1
         _stats["by_tier"][tier] += 1
+        if origin:
+            safe_origin = str(origin).replace("\n", " ").replace("\r", " ")[:200]
+        else:
+            safe_origin = "(none)"
+        _stats["by_origin"][safe_origin] += 1
         # Dropped probes: by_path aggregates immediately so a scan can't
         # add one dict key per request, but recent history (bounded deque
         # of 50) retains the actual path for PROBE_COLLAPSE_AFTER_SECONDS
@@ -986,6 +1005,67 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _cors_origin_header(self):
+        return getattr(self, "_cors_origin", None)
+
+    def _apply_cors(self, preflight=False):
+        origin = self._cors_origin_header()
+        if not origin:
+            return
+        self.send_header("Access-Control-Allow-Origin", origin)
+        if preflight:
+            req_headers = self.headers.get("Access-Control-Request-Headers")
+            allow_headers = req_headers if req_headers else "Content-Type, Authorization, Accept"
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", allow_headers)
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.send_header("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
+        else:
+            self.send_header("Access-Control-Expose-Headers", "*")
+            self.send_header("Vary", "Origin")
+
+    def _send_upstream_headers(self, resp_headers):
+        """Forward upstream headers, normalizing CORS when configured."""
+        skip = {"transfer-encoding", "connection", "content-length"}
+        vary_parts = []
+        origin = self._cors_origin_header()
+        for k, v in resp_headers:
+            kl = k.lower()
+            if kl in skip:
+                continue
+            if CORS_ENABLED and kl.startswith("access-control-"):
+                continue
+            if kl == "vary":
+                vary_parts.extend([p.strip() for p in v.split(",") if p.strip()])
+                continue
+            self.send_header(k, v)
+        if origin:
+            if not any(p.lower() == "origin" for p in vary_parts):
+                vary_parts.append("Origin")
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Expose-Headers", "*")
+        if vary_parts:
+            seen = set()
+            merged = []
+            for p in vary_parts:
+                key = p.lower()
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(p)
+            self.send_header("Vary", ", ".join(merged))
+
+    def _serve_cors_preflight(self):
+        self._status = 204
+        try:
+            self.send_response(204)
+            self._apply_cors(preflight=True)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self._client_gone = True
+
     def _serve_stub_tags(self):
         # Replay the cached real entry for the forced model (fetched at startup).
         # Only the forced model is ever visible to non-admins, so they can never
@@ -1041,6 +1121,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self._apply_cors()
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
@@ -1063,6 +1144,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # 204 must not carry a body or Content-Length; close so HTTP/1.1
             # clients don't wait for one.
             self.send_header("Cache-Control", "no-store")
+            self._apply_cors()
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
@@ -1076,7 +1158,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         retains the actual path for PROBE_COLLAPSE_AFTER_SECONDS."""
         self._status = 444
         self.close_connection = True
-        _record(path, "anonymous", 444, 0.0)
+        _record(path, "anonymous", 444, 0.0, origin=getattr(self, "_origin", None))
         with _stats_lock:
             if _stats["recent"]:
                 _stats["recent"][0]["method"] = self.command
@@ -1130,7 +1212,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._gate_entry = None
                 self._status = 503
                 self._respond(503, {"error": f"proxy busy: queue full (max {MAX_QUEUE} waiting, {MAX_CONCURRENT} running)"})
-                _record(path, tier, 503, 0.0)
+                _record(path, tier, 503, 0.0, origin=getattr(self, "_origin", None))
                 return False
             _gate_waiters += 1
             _gate_queued.append(entry)
@@ -1159,7 +1241,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     # set by _is_client_alive). Still call it for consistent
                     # 503 semantics + queue_rejected accounting.
                     self._respond(503, {"error": "proxy busy: client disconnected while queued"})
-                    _record(path, tier, 503, time.monotonic() - t0)
+                    _record(path, tier, 503, time.monotonic() - t0, origin=getattr(self, "_origin", None))
                     return False
             if got:
                 entry["started_at"] = time.time()
@@ -1174,7 +1256,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._gate_entry = None
                 self._status = 503
                 self._respond(503, {"error": f"proxy busy: timed out after {int(QUEUE_TIMEOUT)}s waiting (limit {MAX_CONCURRENT} concurrent)"})
-                _record(path, tier, 503, time.monotonic() - t0)
+                _record(path, tier, 503, time.monotonic() - t0, origin=getattr(self, "_origin", None))
             return got
         finally:
             self._wait_seconds = round(time.monotonic() - t0, 3)
@@ -1183,6 +1265,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 _remove_gate_entry(_gate_queued, entry)
 
     def _handle(self):
+        self._origin = self.headers.get("Origin")
+        self._cors_origin = self._origin if (CORS_ENABLED and self._origin in _CORS_ALLOWED_SET) else None
         # Probe mitigation, before auth / rate-limit / gate / upstream:
         # invalid paths get an nginx-444 drop (no reply, no upstream).
         _req_path = self.path.split("?", 1)[0]
@@ -1191,17 +1275,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._drop_probe(_req_path)
             return
         start = time.monotonic()
+        # CORS preflight: answer locally for allowed origins on valid paths.
+        if (self._cors_origin and self.command == "OPTIONS"
+                and self.headers.get("Access-Control-Request-Method")):
+            self._serve_cors_preflight()
+            duration = time.monotonic() - start
+            self._log(path, "anonymous", f" {round(duration, 3)}s cors-preflight")
+            _record(path, "anonymous", 204, duration, origin=self._origin)
+            with _stats_lock:
+                if _stats["recent"]:
+                    _stats["recent"][0]["method"] = self.command
+            return
         # Root liveness probe: plain-text, no upstream call, no queue.
         if self.path.split("?", 1)[0] == "/" and self.command == "GET":
             self._serve_root()
-            _record("/", "anonymous", 200, 0.0)
+            _record("/", "anonymous", 200, 0.0, origin=self._origin)
             return
         # Favicon check: browsers request /favicon.ico for any HTML page.
         # Serve it locally with 204 so it is never dropped as a probe or
         # proxied upstream. Also declared in the status page's <head>.
         if _req_path in FAVICON_PATHS and self.command in ("GET", "HEAD"):
             self._serve_favicon()
-            _record(_req_path, "anonymous", 204, 0.0)
+            _record(_req_path, "anonymous", 204, 0.0, origin=self._origin)
             return
         # Status page is handled locally (admin-only). Supports browser Basic auth
         # (user "admin", password = any admin API key) and admin Bearer/X-API-Key.
@@ -1214,13 +1309,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     self.send_header("Content-Type", "application/json")
                     self.send_header("WWW-Authenticate", 'Basic realm="ollama-front status"')
                     self.send_header("Content-Length", str(len(body)))
+                    self._apply_cors()
                     self.send_header("Connection", "close")
                     self.end_headers()
                     self.close_connection = True
                     self.wfile.write(body)
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     self._client_gone = True
-                _record(STATUS_PATH, "anonymous", 401, 0.0)
+                _record(STATUS_PATH, "anonymous", 401, 0.0, origin=self._origin)
                 return
             self._serve_status()
             return
@@ -1231,7 +1327,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             key0, tier0 = get_tier(self.headers)
             if tier0 != "admin":
                 self._serve_stub_tags()
-                _record("/api/tags", tier0, 200, 0.0)
+                _record("/api/tags", tier0, 200, 0.0, origin=self._origin)
                 return
         # Stub /v1/models and /v1/models/:id locally (same idea as tags).
         if STUB_TAGS and (path == "/v1/models" or path.startswith("/v1/models/")):
@@ -1241,7 +1337,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     self._serve_stub_v1_models()
                 else:
                     self._serve_stub_v1_model()
-                _record(path, tier0, 200, 0.0)
+                _record(path, tier0, 200, 0.0, origin=self._origin)
                 return
         key, tier = get_tier(self.headers)
 
@@ -1272,11 +1368,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # lightweight probes/stubs still consume the global anon/standard quota.
         if path == "/api/version" and self.command == "GET":
             self._serve_fixed_version()
-            _record(path, tier, 200, 0.0)
+            _record(path, tier, 200, 0.0, origin=self._origin)
             return
         if path == "/api/ps" and self.command == "GET" and tier != "admin":
             self._serve_stub_ps()
-            _record(path, tier, 200, 0.0)
+            _record(path, tier, 200, 0.0, origin=self._origin)
             return
 
         body, body_too_large = _read_request_body(self)
@@ -1284,7 +1380,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if body_too_large:
             self._status = 413
             self._respond(413, {"error": "request body too large"})
-            _record(path, tier, 413, 0.0)
+            _record(path, tier, 413, 0.0, origin=self._origin)
             return
 
         # Concurrency gate: hold a slot for the whole upstream exchange.
@@ -1398,10 +1494,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                 except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                                     out = raw
                         self.send_response(resp.status)
-                        for k, v in resp.getheaders():
-                            if k.lower() in ("transfer-encoding", "connection", "content-length"):
-                                continue
-                            self.send_header(k, v)
+                        self._send_upstream_headers(resp.getheaders())
                         self.send_header("Content-Length", str(len(out)))
                         self.end_headers()
                         try:
@@ -1415,10 +1508,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         # upstream is silent — resp.read() would otherwise block for
                         # the full socket timeout and defeat _is_client_alive().
                         self.send_response(resp.status)
-                        for k, v in resp.getheaders():
-                            if k.lower() in ("transfer-encoding", "connection", "content-length"):
-                                continue
-                            self.send_header(k, v)
+                        self._send_upstream_headers(resp.getheaders())
                         self.send_header("Transfer-Encoding", "chunked")
                         self.end_headers()
                         client_dead = False
@@ -1495,13 +1585,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._holds_slot = False
         duration = time.monotonic() - start
         self._log(path, tier, f" {round(duration, 3)}s{upstream_detail}")
-        _record(path, tier, self._status, duration)
+        _record(path, tier, self._status, duration, origin=self._origin)
         # keep method in recent-request record
         with _stats_lock:
             if _stats["recent"]:
                 _stats["recent"][0]["method"] = self.command
 
-    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = _handle
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _handle
 
     def _respond(self, status, obj):
         # Drain any unread request body so it isn't parsed as a new request.
@@ -1516,6 +1606,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            self._apply_cors()
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
@@ -1552,6 +1643,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             by_status = dict(_stats["by_status"])
             by_tier = dict(_stats["by_tier"])
             by_path = dict(_stats["by_path"])
+            by_origin = dict(_stats["by_origin"])
             blocked = _stats["blocked_pulls"]
             limited = _stats["rate_limited"]
             invalid = _stats["invalid_keys"]
@@ -1591,6 +1683,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             f"<tr><td>{esc(k)}</td><td>{esc(v)}</td></tr>"
             for k, v in sorted(by_path.items(), key=lambda x: -x[1])
         ) or "<tr><td colspan=2>no requests yet</td></tr>"
+        origin_rows = "".join(
+            f"<tr><td>{esc(k)}</td><td>{esc(v)}</td></tr>"
+            for k, v in sorted(by_origin.items(), key=lambda x: (-x[1], x[0]))
+        ) or "<tr><td colspan=2>no requests yet</td></tr>"
         recent_rows = "".join(
             f"<tr><td>{esc(r['time'])}</td><td>{esc(r['method'])}</td>"
             f"<td>{esc(r['path'])}{esc(f' ×{r['count']}' if r.get('count') and r['count'] > 1 else '')}</td>"
@@ -1601,6 +1697,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         tier_key_rows = "".join(
             f"<tr><td>{esc(t)}</td><td>{n}</td></tr>" for t, n in sorted(tiers.items())
         ) or "<tr><td colspan=2>no API keys configured</td></tr>"
+        if CORS_ALLOWED_ORIGINS:
+            cors_allowed_rows = "".join(
+                f"<tr><td>{esc(o)}</td></tr>" for o in CORS_ALLOWED_ORIGINS
+            )
+        else:
+            cors_allowed_rows = "<tr><td>none configured</td></tr>"
         running_rows = "".join(
             f"<tr><td>{esc(fmt_hms(r.get('started_at') or r.get('queued_at')))}</td>"
             f"<td>{esc(r['method'])}</td><td>{esc(r['path'])}</td>"
@@ -1661,6 +1763,10 @@ table{{border-collapse:collapse;min-width:280px}} td,th{{border:1px solid #ccc;p
 <h2>Requests by status</h2><table>{status_rows}</table>
 <h2>Requests by tier</h2><table>{tier_rows}</table>
 <h2>Requests by path</h2><table>{path_rows}</table>
+<h2>CORS</h2>
+<p>Allowed origins (reflected only when the request Origin matches):</p>
+<table><tr><th>Origin</th></tr>{cors_allowed_rows}</table>
+<h2>Requests by origin</h2><table><tr><th>Origin</th><th>Requests</th></tr>{origin_rows}</table>
 <h2>API keys configured</h2><table><tr><th>Tier</th><th>Key count</th></tr>{tier_key_rows}</table>
 <p><small>Auto-refreshes every 10s. API keys are never displayed.</small></p>
 </body></html>"""
@@ -1668,6 +1774,7 @@ table{{border-collapse:collapse;min-width:280px}} td,th{{border:1px solid #ccc;p
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self._apply_cors()
         self.end_headers()
         self.wfile.write(data)
 
