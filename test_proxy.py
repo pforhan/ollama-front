@@ -251,11 +251,15 @@ def check_dedup():
           and "old_probe" in src and "_PROBE_PLACEHOLDER" in src)
     check("§1 model context rewrite helper (_rewrite_model_context)",
           "def _rewrite_model_context" in src)
-    rewrite_gate = re.search(r"tier != \"admin\" and \((.*?)\):",
-                             src, re.S)
-    rewrite_gate = rewrite_gate.group(1) if rewrite_gate else ""
+    # Proxied buffered non-admin JSON responses: rewrite/sanitize model metadata
+    # for show/tags/v1/models paths (timing rounding is applied separately for all
+    # non-admin JSON responses, so this is a nested path-specific gate).
+    rewrite_gate = re.search(
+        r'if path == "/api/show" or path == "/api/tags" or \\\s*'
+        r'path == "/v1/models" or path\.startswith\("/v1/models/"\):',
+        src)
     check("§1 proxied model stats rewrite covers show/tags/v1/models",
-          all(p in rewrite_gate for p in ('/api/show', '/api/tags', '/v1/models', '/v1/models/'))
+          rewrite_gate is not None
           and "_rewrite_model_context(payload)" in src
           and "_sanitize_model_info(payload)" in src)
     check("§1 stubs rewrite model context when configured",
